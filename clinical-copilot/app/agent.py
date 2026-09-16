@@ -129,7 +129,11 @@ class ClinicalCopilotAgent:
         tool_call_log: list[dict] = []
 
         for round_index in range(MAX_TOOL_ROUNDS):
-            t0 = time.monotonic()
+            llm_handle = trace.start_llm_call(
+                round_index=round_index,
+                model=self._settings.anthropic_model,
+                input_payload={"system": SYSTEM_PROMPT, "messages": _messages_to_jsonable(messages)},
+            )
             response = self._client.messages.create(
                 model=self._settings.anthropic_model,
                 max_tokens=1024,
@@ -137,9 +141,9 @@ class ClinicalCopilotAgent:
                 tools=TOOLS,
                 messages=messages,
             )
-            trace.log_llm_call(
-                round_index=round_index,
-                latency_s=time.monotonic() - t0,
+            trace.finish_llm_call(
+                llm_handle,
+                output_payload=_blocks_to_jsonable(response.content),
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
             )
@@ -152,17 +156,12 @@ class ClinicalCopilotAgent:
             messages.append({"role": "assistant", "content": response.content})
             tool_results_content = []
             for block in tool_use_blocks:
-                t_tool = time.monotonic()
+                tool_handle = trace.start_tool_call(tool_name=block.name, input_payload=block.input)
                 output = self._call_tool(block.name, block.input)
-                latency = time.monotonic() - t_tool
-
                 is_failure = isinstance(output, ToolFailure)
-                trace.log_tool_call(
-                    tool_name=block.name,
-                    input=block.input,
-                    latency_s=latency,
-                    failed=is_failure,
-                )
+                trace.finish_tool_call(tool_handle, output_payload=_to_jsonable(output), failed=is_failure)
+                latency = time.monotonic() - tool_handle.wall_t0
+
                 tool_call_log.append(
                     {
                         "tool": block.name,
@@ -226,3 +225,35 @@ def _to_jsonable(output) -> dict:
     if isinstance(output, (GetPatientSnapshotOutput, CheckAllergyConflictOutput, ToolFailure)):
         return output.model_dump()
     return {"error": "unexpected tool output type"}
+
+
+def _blocks_to_jsonable(blocks) -> list[dict]:
+    """Anthropic content blocks (TextBlock/ToolUseBlock, ...) -> plain dicts,
+    for Langfuse trace input/output -- the SDK objects themselves aren't
+    reliably JSON-serializable over the OTEL exporter."""
+    out = []
+    for b in blocks:
+        if b.type == "text":
+            out.append({"type": "text", "text": b.text})
+        elif b.type == "tool_use":
+            out.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
+        elif b.type == "thinking":
+            out.append({"type": "thinking", "thinking": b.thinking})
+        elif b.type == "redacted_thinking":
+            out.append({"type": "redacted_thinking"})
+        else:
+            out.append({"type": b.type})
+    return out
+
+
+def _messages_to_jsonable(messages: list[dict]) -> list[dict]:
+    """Same as _blocks_to_jsonable, but for a full messages list where an
+    assistant turn's content may be raw SDK content blocks (appended
+    directly from response.content) rather than plain dicts."""
+    out = []
+    for msg in messages:
+        content = msg["content"]
+        if isinstance(content, list) and content and hasattr(content[0], "type") and not isinstance(content[0], dict):
+            content = _blocks_to_jsonable(content)
+        out.append({"role": msg["role"], "content": content})
+    return out

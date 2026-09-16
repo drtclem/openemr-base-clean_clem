@@ -68,45 +68,88 @@ class TurnObserver:
 
 
 @dataclass
+class LlmCallHandle:
+    round_index: int
+    wall_t0: float
+    langfuse_span: Any
+
+
+@dataclass
+class ToolCallHandle:
+    tool_name: str
+    input_payload: dict
+    wall_t0: float
+    langfuse_span: Any
+
+
+@dataclass
 class TurnTrace:
     client: Any
     span: Any
     correlation_id: str
 
-    def log_llm_call(self, *, round_index: int, latency_s: float, input_tokens: int, output_tokens: int) -> None:
+    def start_llm_call(self, *, round_index: int, model: str, input_payload: Any) -> "LlmCallHandle":
+        """Opens the Langfuse generation span *before* the API call, so its
+        start_time is real. Call finish_llm_call() after the response comes
+        back -- creating and ending the span back-to-back (the previous bug
+        here) gives every call 0.00s latency regardless of how long it took."""
+        wall_t0 = time.monotonic()
+        langfuse_span = None
+        if self.span is not None:
+            langfuse_span = self.span.start_observation(
+                name=f"llm_call_{round_index}",
+                as_type="generation",
+                model=model,
+                input=input_payload,
+            )
+        return LlmCallHandle(round_index=round_index, wall_t0=wall_t0, langfuse_span=langfuse_span)
+
+    def finish_llm_call(
+        self, handle: "LlmCallHandle", *, output_payload: Any, input_tokens: int, output_tokens: int
+    ) -> None:
+        latency_s = time.monotonic() - handle.wall_t0
         _log(
             "llm_call",
             correlation_id=self.correlation_id,
-            round_index=round_index,
+            round_index=handle.round_index,
             latency_s=round(latency_s, 3),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
-        if self.span is not None:
-            child = self.span.start_observation(
-                name=f"llm_call_{round_index}",
-                as_type="generation",
+        if handle.langfuse_span is not None:
+            handle.langfuse_span.update(
+                output=output_payload,
                 usage_details={"input": input_tokens, "output": output_tokens},
             )
-            child.end()
+            handle.langfuse_span.end()
 
-    def log_tool_call(self, *, tool_name: str, input: dict, latency_s: float, failed: bool) -> None:
+    def start_tool_call(self, *, tool_name: str, input_payload: dict) -> "ToolCallHandle":
+        wall_t0 = time.monotonic()
+        langfuse_span = None
+        if self.span is not None:
+            langfuse_span = self.span.start_observation(
+                name=f"tool:{tool_name}",
+                as_type="tool",
+                input=input_payload,
+            )
+        return ToolCallHandle(tool_name=tool_name, input_payload=input_payload, wall_t0=wall_t0, langfuse_span=langfuse_span)
+
+    def finish_tool_call(self, handle: "ToolCallHandle", *, output_payload: Any, failed: bool) -> None:
+        latency_s = time.monotonic() - handle.wall_t0
         _log(
             "tool_call",
             correlation_id=self.correlation_id,
-            tool=tool_name,
-            input=input,
+            tool=handle.tool_name,
+            input=handle.input_payload,
             latency_s=round(latency_s, 3),
             failed=failed,
         )
-        if self.span is not None:
-            child = self.span.start_observation(
-                name=f"tool:{tool_name}",
-                as_type="tool",
-                input=input,
+        if handle.langfuse_span is not None:
+            handle.langfuse_span.update(
+                output=output_payload,
                 level="ERROR" if failed else "DEFAULT",
             )
-            child.end()
+            handle.langfuse_span.end()
 
     def log_verification(
         self,
