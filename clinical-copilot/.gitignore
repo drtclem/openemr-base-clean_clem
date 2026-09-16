@@ -5,3 +5,4 @@ __pycache__/
 docker/.env.langfuse
 evals/last_run_results.json
 evals/last_behavioral_run_results.json
+load_test/results/
