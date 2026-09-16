@@ -13,12 +13,15 @@ surfaced, see README).
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 import anthropic
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -39,6 +42,35 @@ _READINESS_TIMEOUT_S = 2.5
 _OPENEMR_READINESS_TIMEOUT_S = 5.0
 
 app = FastAPI(title="Clinical Co-Pilot (Early Submission)")
+
+_REQUEST_TIMING_LOG_PATH = Path(__file__).parent.parent / "request_timing.log"
+
+
+@app.middleware("http")
+async def request_timing_middleware(request: Request, call_next):
+    """Independent request-timing log -- plain file I/O, zero dependency on
+    Langfuse being configured or reachable (ERROR_ANALYSIS.md Entry 6).
+
+    PERFORMANCE_BASELINE.md's droplet load test found Langfuse's own
+    telemetry can itself go quiet under real contention: only 5 of 20 real
+    requests produced an AGENT span there, with the span duration it did
+    record far below what the client actually experienced. This starts
+    timing at the ASGI/middleware layer -- before routing reaches the
+    /chat handler, and therefore before any Langfuse span is opened --
+    so real request latency is captured even when Langfuse's own
+    instrumentation degrades under load.
+    """
+    start = time.monotonic()
+    response = await call_next(request)
+    duration_s = time.monotonic() - start
+    line = (
+        f"{datetime.now(timezone.utc).isoformat()},{request.method},"
+        f"{request.url.path},{duration_s:.3f},{response.status_code}\n"
+    )
+    with _REQUEST_TIMING_LOG_PATH.open("a") as f:
+        f.write(line)
+    return response
+
 
 _settings = get_settings()
 _tokens = OAuthTokenProvider(_settings)

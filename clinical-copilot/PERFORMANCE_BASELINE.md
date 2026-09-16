@@ -143,6 +143,43 @@ number above. It is noted here as a concrete next step (a client-observable or r
 latency signal, independent of the agent's own internal instrumentation, would close this gap),
 not fixed in this session, which was scoped to running and honestly reporting the load test.
 
+### Addendum (2026-09-16, same evening): root cause confirmed and resolved -- see ERROR_ANALYSIS.md Entry 6
+
+Two things happened after the finding above, both real, both verified, not just asserted:
+
+1. **A scoped, Langfuse-independent fix** — a small request-timing middleware in `app/main.py`
+   (`request_timing.log`, plain file I/O, zero dependency on Langfuse) was added specifically so
+   real request latency is captured even if Langfuse's own telemetry degrades again.
+2. **The droplet was resized 2 vCPU/4GB → 4 vCPU/8GB**, testing the theory directly: that the gap
+   was CPU contention starving Langfuse's own ingestion pipeline, not a Langfuse limitation.
+
+Re-running the *exact same* 10-concurrent-user droplet stage after both changes, and comparing all
+three latency sources for the same 22 real completed requests:
+
+| Source | p50 | p95 | max | span/record count |
+|---|---|---|---|---|
+| Locust (client-side ground truth) | 14.0s | 37.0s | 36.64s | 22/22 requests |
+| Langfuse `AGENT`-span (ClickHouse) | 11.68s | 34.50s | 34.90s | **22/22** (was 5/20) |
+| New `request_timing.log` | 12.72s | 36.62s | 36.62s | 22/22 (mean 19.03s vs. Locust's own mean 19.04s) |
+
+**Conclusion, stated honestly:** the resize alone resolved the observability gap at its root. All
+three independent sources now agree within a few seconds of each other, and Langfuse's own span
+count exactly matches the real request count (22/22) instead of badly undercounting (5/20). This
+confirms the original theory — CPU contention on the old 2-vCPU box was starving Langfuse's own
+ingestion pipeline, not a fundamental Langfuse limitation — and no separate monitoring pipeline is
+needed to close this specific gap. Container CPU also confirms the contention itself eased: peak
+CPU on the 4-vCPU box (`openemr` 212.9%, `langfuse-web` 139.8%, `clickhouse` 86.1%) is well under
+the new ~400% ceiling, where `clickhouse` alone previously consumed 165.8% of the old ~200% ceiling.
+
+**What did *not* fully resolve, stated honestly rather than declaring total victory:** p95 latency
+at 10 concurrent droplet users (34.5-37s across all three sources) is still noticeably above the
+droplet's own single-user historical baseline (p50≈12.8s/p95≈19.7s, ARCHITECTURE.md §7.7) — roughly
+a 2x concurrency cost remains, just nowhere near the previous 5-10x blowup. And because the
+telemetry is trustworthy again, the droplet's p95-latency Monitor correctly fired
+(`severity: ALERT` at `23:37:10Z`) on this very run — the alerting system working exactly as
+designed once its underlying data can be trusted. The `request_timing.log` middleware stays in
+place regardless, as a permanent, low-cost, Langfuse-agnostic safety net.
+
 ## Connecting back to KEY_METRICS.md and the configured alerts
 
 KEY_METRICS.md names p95 latency as a supporting metric specifically to guard against

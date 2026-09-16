@@ -341,3 +341,80 @@ way `history` already is, rather than resetting them every turn:
    expected reason (the duplicate-warning-repetition design tension); its
    `flagged_claims` is now `[]` on both, where it was previously
    `['penicillin']` on the droplet run that discovered this bug.
+
+## Entry 6 — Langfuse's own telemetry went blind under droplet CPU contention (2026-09-16)
+
+**Observed:** `PERFORMANCE_BASELINE.md`'s droplet load test (10 concurrent users, 20 real
+completed requests, 0 errors) showed a stark mismatch between what residents actually experienced
+and what our own observability recorded:
+- Locust (client-side, real wall-clock): p95 = 154.0s, max = 154.19s.
+- Langfuse's own recorded `AGENT`-span duration for the same window, queried directly from the
+  droplet's ClickHouse: only **5 of 20** real requests produced an `AGENT` span at all, and the
+  ones that did showed p95 = 17.2s, max = 17.7s — nowhere near what the client actually waited.
+
+Locally, the same query against the same kind of load (130 real requests across two stages) showed
+a clean 130/130 `AGENT`-span match with latency tracking the client-observed numbers reasonably
+closely. This was droplet-specific, not a general bug in the instrumentation code.
+
+**Root cause (confirmed, not just theorized):** severe CPU contention on the droplet's original
+2-vCPU/4GB sizing. `clickhouse` alone peaked at 165.8% CPU — more than one full core — on a box
+with only two. Under that contention, requests spent real time queued before our own instrumented
+code path (and therefore any Langfuse span) even began, and `app/observability.py`'s deliberate
+best-effort design (a Langfuse outage must never break the resident-facing response — see Entry 1's
+`start_llm_call`/`finish_llm_call` split for the same underlying philosophy) meant span-create
+calls to the self-hosted Langfuse ingestion endpoint could silently fail under that contention
+without surfacing anywhere. The system stayed correct (0 errors) but its own telemetry didn't.
+
+**Why this mattered concretely:** the droplet's p95-latency Monitor (ARCHITECTURE.md §7.7,
+threshold 30,000 ms) read `severity: OK` throughout the entire 154-second-real-wait load test. A
+real, severe degradation produced no alert, because the alert's data source was itself a casualty
+of the same contention it exists to catch.
+
+**Fix, in two parts, both real and both verified:**
+
+1. **Scoped, Langfuse-independent request-timing log** (`app/main.py`): a small ASGI middleware
+   (`request_timing_middleware`) that starts timing at the moment a request enters the middleware
+   stack — before routing, before the `/chat` handler, before any Langfuse span opens — and appends
+   one line per request (timestamp, method, path, duration, status) to `request_timing.log`. Plain
+   Python file I/O, no import from `app/observability.py`, no dependency on Langfuse being
+   configured or reachable. This is deliberately the small, scoped fix, not the full independent
+   monitoring pipeline described below.
+2. **Droplet resized 2 vCPU/4GB → 4 vCPU/8GB**, to test directly whether the root cause was
+   resource contention (fixable by headroom) rather than a Langfuse limitation (which resizing
+   wouldn't fix).
+
+**Verification — re-ran the exact same 10-concurrent-user droplet stage after both changes, and
+compared three independent sources for the same 22 real completed requests (0 errors):**
+
+| Source | p50 | p95 | max | count vs. real requests |
+|---|---|---|---|---|
+| Locust (ground truth) | 14.0s | 37.0s | 36.64s | 22/22 |
+| Langfuse `AGENT`-span | 11.68s | 34.50s | 34.90s | **22/22** (was 5/20 before the resize) |
+| `request_timing.log` | 12.72s | 36.62s | 36.62s | 22/22, mean 19.03s vs. Locust's own mean 19.04s |
+
+All three sources now agree within a few seconds of each other, and Langfuse's own span count
+exactly matches the real request count. Peak container CPU on the resized box (`openemr` 212.9%,
+`langfuse-web` 139.8%, `clickhouse` 86.1%) sits comfortably under the new ~400% ceiling, where
+`clickhouse` alone previously exceeded the old ~200% ceiling by itself. As direct confirmation the
+telemetry is trustworthy again: the droplet's p95-latency Monitor correctly fired
+(`severity: ALERT`, `23:37:10Z`) on this very run, because the real p95 (34.5-37s) genuinely
+exceeds its 30,000 ms threshold — the alert working exactly as designed once its data source could
+be trusted, in contrast to the silent `OK` it showed during the original, undiagnosed contention.
+
+**Stated honestly, not oversold:** the resize resolved the *observability* gap at its root — this
+was a resource-contention problem, not a fundamental Langfuse limitation, confirmed rather than
+assumed. It did not fully resolve *latency itself*: p95 at 10 concurrent droplet users (34.5-37s)
+remains roughly 2x the droplet's own single-user baseline (p50≈12.8s/p95≈19.7s, ARCHITECTURE.md
+§7.7) — a real, smaller, remaining concurrency cost, consistent with `PERFORMANCE_BASELINE.md`'s
+broader finding that OpenEMR/FHIR access, not the agent's own code, is the dominant latency lever
+at scale.
+
+**Deliberately not attempted here — named as separate future work:** a proper independent
+monitoring pipeline that doesn't depend on the resident-facing request path at all (e.g., a
+lightweight reverse proxy logging its own timing independent of the application process, or a
+synthetic canary request run on a fixed schedule regardless of real traffic). `request_timing.log`
+is a genuinely useful, permanent, zero-cost safety net that stays in place regardless of what
+caused tonight's specific gap, but it still lives inside the same application process as everything
+else — a canary or proxy-level signal would be a strictly stronger, independent check, and is real
+infrastructure work requiring its own careful build and verification, not something to fold into a
+one-evening fix.
