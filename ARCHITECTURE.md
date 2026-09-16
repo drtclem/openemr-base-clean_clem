@@ -162,6 +162,14 @@ instruction the model might or might not follow:
 The principle throughout: anything where a wrong answer is dangerous is enforced in code the model
 cannot reason its way around, not requested of the model as an instruction.
 
+This is a direct application of a well-established pattern in agent evaluation: fixes that live
+in the environment or tool layer hold; fixes that only live in prompt wording don't, because the
+model can still *want* to do the wrong thing even when a guardrail stops it from succeeding.
+`check_allergy_conflict` is a wall, not a request — it doesn't ask the model to be careful about
+allergies, it makes an allergy-conflicting response structurally impossible to complete. The
+distinction matters: a prompt instruction can be forgotten or reasoned around; a code-level check
+cannot.
+
 ## 3.3 Sensitivity compensating control
 
 Because whether the resident's own `user/`-scoped token enforces sensitivity filtering is

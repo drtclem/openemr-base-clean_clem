@@ -32,6 +32,13 @@ whether the product is delivering on its core promise.
 but the metric is tracked as a rate specifically to surface *how often* the verification layer is
 catching something, which is itself useful signal, not just a pass/fail gate.
 
+**Honest caveat on sample size:** at n=8 (the current Golden Set size), a 90% pass rate carries
+a 95% confidence interval of roughly ±20 points (using the standard proportion margin-of-error
+formula, 1.96 × √(p(1−p)/n)). In practice this means small movements in the North Star metric —
+a single case flipping pass/fail — are not yet statistically meaningful at this sample size. This
+metric becomes trustworthy as a trend only once the case count grows meaningfully (the planned
+Behavioral Coverage set, 30-100+ cases, is what closes this gap).
+
 ---
 
 ## Supporting metric 1: Tool failure rate

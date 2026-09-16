@@ -54,6 +54,19 @@ much wider range of phrasings and scenarios per USERS.md use case, run
 per-release rather than per-commit, evaluated for *patterns* of weakness
 rather than pass/fail correctness.
 
+**Process for building this, not just the target size:** the right way to
+build this set is not to generate 30-100 cases from a generic checklist.
+It's to read real conversation traces one at a time, write down in plain
+language what went wrong (if anything) with no taxonomy in front of you,
+and only then cluster those notes into named failure-mode categories
+specific to this product. A downloaded or AI-generated taxonomy is useful
+for checking coverage after the fact, but useless as a starting point --
+this agent will fail in ways specific to clinical cross-coverage that no
+generic list would name. This process requires real usage data (or, before
+that exists, a deliberate red-teaming session using the same real-trace-
+reading discipline) -- it is not something to shortcut by having an LLM
+invent scenarios directly.
+
 **Langfuse Datasets/Experiments wiring:** register the Golden Set's 8 cases
 as a persisted Langfuse Dataset (one item per case, keyed by case name for
 idempotent re-creation) so pass-rate history becomes a visible trend across
