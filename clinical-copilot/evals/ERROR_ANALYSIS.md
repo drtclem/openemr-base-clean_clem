@@ -10,6 +10,51 @@ status, if not yet fixed).
 
 ---
 
+## Planned: clinician (SME) review process — not yet implemented
+
+Everything in the entries below was reviewed for *technical* correctness
+
+(did the code behave as
+designed, did a claim trace to real data) — not for *clinical* soundness. Nobody with actual
+clinical training has looked at whether the agent's responses represent good clinical judgment,
+only whether they're technically grounded in the chart. Those are genuinely different questions,
+and conflating them would be a real gap this project shouldn't paper over.
+
+**What a real clinician review process would add, that technical review can't:**
+- Whether a technically-correct, fully-sourced response is actually the *clinically useful* thing
+  to say in that moment — e.g., is the level of detail right, is anything technically true but
+  clinically misleading by omission, would a real resident actually find this helpful at 2 a.m.
+- Judgment calls no eval check can encode: is this specific allergy conflict a hard stop or a
+  "use clinical judgment" situation; is this duplicate-record warning appropriately urgent or
+  overstated
+- Catching a category of error that's invisible to source-attribution checks entirely: a response
+  can cite real data accurately and still represent bad clinical reasoning about what that data
+  means
+
+**Planned process (once a clinical advisor/reviewer is available):**
+1. **What gets reviewed:** not just failures — a periodic sample of both flagged cases (where
+   verification caught something) and a random sample of *passing* cases, since a false sense of
+   safety from "it passed eval" is itself a risk this project is specifically trying to avoid.
+2. **Cadence:** reviewed in batches (e.g., weekly during active development, monthly once stable)
+   rather than one-off — this is meant to be an ongoing practice, matching the same "running log,
+   not a one-time document" principle as the rest of this file.
+3. **What happens with findings:** any clinically-flagged issue gets written up in this same file
+   as a new entry, and — critically — gets converted into either a new eval case (if it's a
+   pattern worth guarding against permanently) or a new domain constraint rule in `verification.py`
+   (if it's a hard clinical rule that should never depend on model judgment), not just noted and
+   forgotten.
+4. **Who:** a licensed clinician (ideally someone with experience in the actual target workflow —
+   overnight cross-coverage or hospitalist medicine, per `USERS.md`) reviewing specific
+   transcripts, not a general medical advisor reviewing the concept in the abstract.
+
+**Why this is stated as a plan rather than something faked today:** simulating clinical review
+without an actual clinician would be worse than admitting the gap — it would create false
+confidence in exactly the dimension (real clinical judgment) that matters most to this project's
+core premise. This is deliberately left as an open, named next step rather than something checked
+off prematurely.
+
+
+
 ## Entry 1 — Langfuse span timing bug (2026-09-16)
 
 **Observed:** In the Langfuse trace view, `llm_call_0` (and every other
