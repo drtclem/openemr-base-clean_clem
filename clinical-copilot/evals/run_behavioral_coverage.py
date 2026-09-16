@@ -26,7 +26,9 @@ from app.observability import TurnObserver
 from evals.behavioral_coverage import BEHAVIORAL_CASES, run_behavioral_case
 
 
-def main() -> int:
+def run_behavioral_suite() -> list[dict]:
+    """Runs every Behavioral Coverage case and returns result dicts, no
+    printing -- the reusable core, shared by main() and evals/run_all.py."""
     settings = get_settings()
     fhir = FhirClient(settings, OAuthTokenProvider(settings))
     observer = TurnObserver(settings)
@@ -65,6 +67,11 @@ def main() -> int:
                 "error": error,
             }
         )
+    return results
+
+
+def main() -> int:
+    results = run_behavioral_suite()
 
     total = len(results)
     passed_count = sum(1 for r in results if r["passed"])

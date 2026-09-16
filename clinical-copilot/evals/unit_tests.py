@@ -143,7 +143,9 @@ TESTS: list[tuple[str, Callable[[FhirClient], tuple[bool, str]]]] = [
 ]
 
 
-def main() -> int:
+def run_all_tests() -> list[tuple[str, bool, str]]:
+    """Runs every test and returns (name, passed, reason) tuples, no
+    printing -- the reusable core, shared by main() and evals/run_all.py."""
     settings = get_settings()
     fhir = FhirClient(settings, OAuthTokenProvider(settings))
 
@@ -154,6 +156,11 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 -- a test must record a failure, not crash the suite
             passed, reason = False, f"raised an exception: {exc!r}"
         results.append((name, passed, reason))
+    return results
+
+
+def main() -> int:
+    results = run_all_tests()
 
     total = len(results)
     passed_count = sum(1 for _, p, _ in results if p)

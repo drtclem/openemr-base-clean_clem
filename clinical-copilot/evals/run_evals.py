@@ -52,7 +52,7 @@ def _print_attempt_catch_rates(results: list[dict]) -> None:
         print("  - Catch rate: N/A (no attempts this run)")
 
 
-def check_gate(results: list[dict], thresholds: dict[str, float] = GATE) -> bool:
+def check_gate(results: list[dict], thresholds: dict[str, float] = GATE, verbose: bool = True) -> bool:
     # The adversarial-category case's whole point is deliberately tripping
     # verification_passed=False on its own turn (drafts an unverified claim
     # so verification can prove it strips it) -- that's success for the
@@ -66,23 +66,28 @@ def check_gate(results: list[dict], thresholds: dict[str, float] = GATE) -> bool
         "verification_passed": [r for r in results if r["category"] != "adversarial"],
         "domain_constraint_pass": results,
     }
-    print(f"\n{'=' * 70}")
-    print("Gate check (hard thresholds -- a failure here blocks, not just informs)")
-    print(f"{'=' * 70}")
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print("Gate check (hard thresholds -- a failure here blocks, not just informs)")
+        print(f"{'=' * 70}")
     failures = []
     for metric, floor in thresholds.items():
         rows = scored.get(metric, results)
         got = (sum(1 for r in rows if r.get(metric)) / len(rows)) if rows else 0.0
-        status = "ok  " if got >= floor else "FAIL"
-        print(f"[{status}] {metric:<24} {got * 100:.0f}% (floor {floor * 100:.0f}%, n={len(rows)})")
+        if verbose:
+            status = "ok  " if got >= floor else "FAIL"
+            print(f"[{status}] {metric:<24} {got * 100:.0f}% (floor {floor * 100:.0f}%, n={len(rows)})")
         if got < floor:
             failures.append(metric)
     gate_passed = not failures
-    print(f"\nGate: {'PASS' if gate_passed else 'BLOCKED'}")
+    if verbose:
+        print(f"\nGate: {'PASS' if gate_passed else 'BLOCKED'}")
     return gate_passed
 
 
-def main() -> int:
+def run_golden_set() -> list[dict]:
+    """Runs every Golden Set case and returns result dicts, no printing --
+    the reusable core, shared by main() and evals/run_all.py."""
     settings = get_settings()
     fhir = FhirClient(settings, OAuthTokenProvider(settings))
     observer = TurnObserver(settings)
@@ -120,6 +125,11 @@ def main() -> int:
                 "error": error,
             }
         )
+    return results
+
+
+def main() -> int:
+    results = run_golden_set()
 
     total = len(results)
     passed_count = sum(1 for r in results if r["passed"])
@@ -130,7 +140,7 @@ def main() -> int:
     print(f"{'=' * 70}")
     print(f"Golden Set:          {passed_count}/{total} passed ({pct}%)")
     _print_attempt_catch_rates(results)
-    print("Behavioral Coverage:  not yet implemented (see evals/COVERAGE.md)")
+    print("Behavioral Coverage:  run separately, not gated -- python3 -m evals.run_behavioral_coverage")
     print(f"{'=' * 70}\n")
 
     for r in results:
