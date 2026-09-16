@@ -115,3 +115,8 @@ This repo is under active development as part of a one-week sprint. Current stat
 - **Fixture patient data was manually copied from the local dev stack to the droplet via SQL
   import** (same UUIDs preserved) rather than created through a repeatable seed script — worth
   turning into an actual script before relying on it again.
+- **The eval suite does not yet test unauthorized-access attempts** ("inputs that attempt to
+  extract information the requester is not authorized to see," per the PRD's Evaluation
+  requirement). This is a direct consequence of the password-grant auth gap above: the current
+  build doesn't yet distinguish requester permission levels, so there's no authorization boundary
+  to test against yet. This becomes testable once the authorization_code migration is complete.
