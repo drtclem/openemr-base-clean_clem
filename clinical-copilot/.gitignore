@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+docker/.env.langfuse
+evals/last_run_results.json
