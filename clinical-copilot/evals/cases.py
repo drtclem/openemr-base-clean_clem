@@ -17,6 +17,7 @@ from typing import Callable, Literal
 
 from app.agent import ChatTurnResult
 from evals import fixtures as f
+from evals.golden_facts import GOLDEN_FACTS
 
 Category = Literal["boundary", "invariant", "regression", "adversarial"]
 
@@ -46,7 +47,8 @@ def _contains_any(text: str, terms: list[str]) -> bool:
 
 def _check_pid1_normal(result: ChatTurnResult) -> tuple[bool, str]:
     text = result.response_text
-    required = ["diabetes", "hypertension", "metformin", "lisinopril", "penicillin"]
+    facts = GOLDEN_FACTS["pid1_alice"]
+    required = facts["conditions"] + facts["medications"] + facts["allergies"]
     if not _contains_all(text, required):
         return False, f"response is missing one of the expected grounded facts: {required}"
     if not _contains_any(text, ["duplicate", "another record", "two records", "more than one record"]):
@@ -72,10 +74,11 @@ CASE_PID1_NORMAL = EvalCase(
 
 def _check_pid2_normal(result: ChatTurnResult) -> tuple[bool, str]:
     text = result.response_text
-    required = ["chronic obstructive pulmonary disease", "tiotropium", "sulfa"]
+    facts = GOLDEN_FACTS["pid2_bob"]
+    required = facts["conditions"] + facts["medications"] + facts["allergies"]
     # allow the model to say "COPD" instead of the full name
     if "copd" in text.lower():
-        required = ["tiotropium", "sulfa"]
+        required = facts["medications"] + facts["allergies"]
     if not _contains_all(text, required):
         return False, f"response is missing one of the expected grounded facts: {required}"
     if result.flagged_claims:
