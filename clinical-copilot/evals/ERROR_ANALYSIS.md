@@ -176,3 +176,69 @@ now, same as the LLM-based eval suite already is.
    infrastructure work. **This is the current state**, chosen deliberately
    to unblock today's demo-video work, not because options 1-2 were ruled
    out -- either remains available as a near-term follow-up.
+
+---
+
+## Entry 4 — COPD grounding false positive, rediscovered via manual trace review (2026-09-16)
+
+**Observed:** Reading through `evals/trace_review_raw.md` (the raw trace
+export built for Behavioral Coverage case-writing, per this file's own
+stated process) surfaced a local trace, timestamp `2026-09-16 01:41:10`
+(trace_id `e4cf75d1bef4d6e700708e1a6ff04680`): asked a routine orientation
+question about pid2 (Bob Testpatient, who genuinely has COPD per
+`get_patient_snapshot`'s real tool output), the model correctly said the
+patient has "COPD" -- and the source-attribution check flagged and
+stripped it as an unverified claim, leaving an almost-empty, unhelpful
+response. This is the inverse of Entry 1/the Warfarin case: a **false
+positive** on the safety net (a true, grounded fact wrongly stripped), not
+a missed hallucination -- and false positives degrade usefulness on
+completely routine questions, which is its own real cost.
+
+**Root cause:** `verification.py`'s grounding check did literal
+substring/text matching between a claimed term and the tool's returned
+text. The tool stores the condition as the full term ("Chronic obstructive
+pulmonary disease"); the model used the standard clinical abbreviation
+("COPD"), which never substring-matches the full term.
+
+**Status: already fixed -- not a live bug.** This is not new work; it's
+independent rediscovery, via manual trace review, of an issue that was
+found and fixed during this project's initial development, before the very
+first commit. The exact timeline is the evidence:
+
+- The buggy trace: `2026-09-16 01:41:10` UTC.
+- Commit `6481789` ("feat(clinical-copilot): add Early Submission build of
+  Clinical Co-Pilot"), the first commit made in this repo, timestamped
+  `2026-09-15 20:48:54 -0500` = **`2026-09-16 01:48:54` UTC** -- roughly
+  seven minutes *after* the buggy trace -- already contains
+  `app/verification.py`'s `_CLINICAL_ALIASES` map (`"copd": "chronic
+  obstructive pulmonary disease"`, plus `htn`, `afib`, `ckd`, `t2dm`/`dm`,
+  `mi`, `chf`) and the `_is_grounded()` helper that checks a claimed term's
+  alias against the grounded set in both directions. `git log -S
+  "_CLINICAL_ALIASES"` confirms this string has existed since that first
+  commit and no other commit has touched it since.
+- In other words: the bug was found and fixed live during initial
+  development, in the roughly seven-minute gap between the buggy trace and
+  the first commit, and has been fixed in every commit since.
+
+**Verification (re-confirming the fix holds, not fixing anything new):**
+1. Live call against pid2 today: `flagged_claims: []`, COPD appears
+   unstripped in the response.
+2. Deterministic check (no LLM call) of `verify_response()` against pid1's
+   real tool output with a hand-built draft using "T2DM" and "HTN" (the
+   other clinically-relevant abbreviations in this fixture set) --
+   `flagged_claims: []` for both, confirming those aliases work too, not
+   just COPD.
+3. True-negative control: the same deterministic check with a fabricated
+   Warfarin claim against pid1 -- `flagged_claims: ['warfarin']`,
+   `passed_source_attribution: False`. The alias map is a small fixed
+   dict, not fuzzy matching, so there's no mechanism by which it could
+   have started letting real hallucinations through.
+
+**Why this is still worth logging as an entry, even though nothing needed
+fixing:** it's genuine evidence that manual trace review adds value beyond
+what the automated eval suite alone catches -- this specific false-positive
+pattern was never written up as a named eval case, and reading real
+conversations surfaced it (or rather, surfaced proof that it had already
+been caught) in a way the Golden Set's 8 cases don't specifically test for.
+That's the exact case `COVERAGE.md`'s stated Behavioral Coverage process is
+meant to make routine.
