@@ -16,7 +16,10 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
+import anthropic
+import httpx
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.agent import ClinicalCopilotAgent
@@ -25,6 +28,15 @@ from app.config import get_settings
 from app.fhir_client import FhirClient
 from app.observability import TurnObserver
 from app.verification import ToolCallRecord
+
+_READINESS_TIMEOUT_S = 2.5
+# The FHIR capability statement (/metadata) is real and unauthenticated, but
+# not as cheap to compute as a plain resource fetch -- measured latency on
+# the droplet is ~2.3-3.5s (vs ~0.6-0.9s locally, consistent with its more
+# modest resources, a pattern seen throughout this project's droplet work),
+# right at or over the general 2.5s budget. A dedicated, more generous
+# timeout for this one check, not a blanket increase for the others.
+_OPENEMR_READINESS_TIMEOUT_S = 5.0
 
 app = FastAPI(title="Clinical Co-Pilot (Early Submission)")
 
@@ -62,6 +74,70 @@ class ChatResponse(BaseModel):
     flagged_claims: list[str]
     enforced_warnings: list[str]
     tool_calls: list[dict]
+
+
+@app.get("/health")
+def health() -> dict:
+    """Returns 200 if the process itself is running -- no dependency
+    checks. Should never fail unless the process is genuinely down."""
+    return {"status": "ok"}
+
+
+def _check_openemr() -> bool:
+    """Reuses the FhirClient's own configured base URL/TLS setting; hits
+    the FHIR capability statement, which per FHIR_README.md needs no auth
+    -- a real, lightweight, unauthenticated connectivity check, not a new
+    heavy call invented for this."""
+    try:
+        resp = httpx.get(
+            f"{_settings.openemr_fhir_base_url}/metadata",
+            timeout=_OPENEMR_READINESS_TIMEOUT_S,
+            verify=_settings.verify_tls,
+        )
+        return resp.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def _check_anthropic() -> bool:
+    """A real API call that validates the key and reachability without
+    burning a completion -- models.list() is a metadata endpoint, not a
+    message generation."""
+    try:
+        client = anthropic.Anthropic(api_key=_settings.anthropic_api_key, timeout=_READINESS_TIMEOUT_S)
+        client.models.list(limit=1)
+        return True
+    except Exception:  # noqa: BLE001 -- any failure here means "not ready", full stop
+        return False
+
+
+def _check_langfuse() -> bool:
+    """If Langfuse isn't configured at all, that's a deliberate,
+    supported configuration (app/observability.py degrades gracefully to
+    local-only logging) -- not a failed dependency, so it doesn't count
+    against readiness. If it IS configured, actually check its real
+    public health endpoint."""
+    if not _settings.observability_enabled:
+        return True
+    try:
+        resp = httpx.get(f"{_settings.langfuse_host}/api/public/health", timeout=_READINESS_TIMEOUT_S)
+        return resp.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+@app.get("/ready")
+def ready() -> JSONResponse:
+    """Actively checks each real dependency, per-dependency breakdown so a
+    failure is diagnosable from the response itself, not just a single
+    true/false (ARCHITECTURE.md 7.6)."""
+    checks = {
+        "openemr": _check_openemr(),
+        "anthropic": _check_anthropic(),
+        "langfuse": _check_langfuse(),
+    }
+    all_ready = all(checks.values())
+    return JSONResponse(status_code=200 if all_ready else 503, content={"ready": all_ready, "checks": checks})
 
 
 @app.post("/chat", response_model=ChatResponse)
