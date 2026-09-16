@@ -91,7 +91,8 @@ MAX_TOOL_ROUNDS = 6
 class ChatTurnResult:
     correlation_id: str
     response_text: str
-    verification_passed: bool
+    verification_passed: bool  # passed_source_attribution AND passed_domain_constraint
+    passed_domain_constraint: bool  # exposed separately -- verification_passed alone can't
     flagged_claims: list[str]
     enforced_warnings: list[str]
     tool_calls: list[dict] = field(default_factory=list)
@@ -208,6 +209,7 @@ class ClinicalCopilotAgent:
             correlation_id=correlation_id,
             response_text=outcome.final_response,
             verification_passed=outcome.passed_source_attribution and outcome.passed_domain_constraint,
+            passed_domain_constraint=outcome.passed_domain_constraint,
             flagged_claims=outcome.flagged_claims,
             enforced_warnings=outcome.enforced_warnings,
             tool_calls=tool_call_log,
