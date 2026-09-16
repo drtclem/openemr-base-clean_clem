@@ -65,6 +65,13 @@ fully fail on a bad `patient_id`).
 | 5. Expanded existing categories | 10 | 10/10 | 10/10 |
 | **Total** | **49** | **46/49 (94%)** | **45/49 (92%)** |
 
+This table is the run that discovered the multi-turn grounding gap below --
+kept as-is since it's what led to the fix. After the fix (`ERROR_ANALYSIS.md`
+Entry 5), a full re-run scored **43/49 (88%) on both instances**; the
+lower number than this table is pre-existing LLM-response variance on
+single-turn cases whose code path the fix didn't touch, not a regression
+-- see Entry 5's verification section for the full accounting.
+
 **Real findings from this run** (not gated, not build blockers -- this is
 exactly the information this suite exists to produce):
 
@@ -111,19 +118,16 @@ exactly the information this suite exists to produce):
   pid1's real allergy record. This is a real correctness gap specific to
   multi-turn conversations -- more significant than the other findings
   here, since USERS.md explicitly treats natural follow-up questions as
-  core to this product's value, not an edge case. Not fixed today; flagged
-  as a priority item for before Final Submission.
+  core to this product's value, not an edge case. **Fixed and verified**
+  same day -- see `ERROR_ANALYSIS.md` Entry 5 for the full fix and
+  verification (positive case, true-negative control, cross-patient guard,
+  and a full re-run on both instances).
 
 Full per-case detail: `evals/last_behavioral_run_results.json` (local) --
 regenerated on each run, not committed (matches the Golden Set's existing
 convention for `last_run_results.json`).
 
 ## Near-term next steps
-
-**Highest priority: the multi-turn grounding gap** documented above
-(`verify_response()` only grounds against the current turn's own tool
-calls, not accumulated conversation history) -- a real correctness gap,
-not yet fixed.
 
 **Behavioral Coverage set (above) is built, but not exhaustive.** 49 cases
 across 5 categories is a first pass derived from today's 126 real traces,

@@ -14,6 +14,7 @@ surfaced, see README).
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -23,6 +24,7 @@ from app.auth import OAuthTokenProvider
 from app.config import get_settings
 from app.fhir_client import FhirClient
 from app.observability import TurnObserver
+from app.verification import ToolCallRecord
 
 app = FastAPI(title="Clinical Co-Pilot (Early Submission)")
 
@@ -32,7 +34,18 @@ _fhir = FhirClient(_settings, _tokens)
 _observer = TurnObserver(_settings)
 _agent = ClinicalCopilotAgent(_settings, _fhir, _observer)
 
-_conversations: dict[str, list[dict]] = {}
+
+@dataclass
+class _ConversationState:
+    history: list[dict] = field(default_factory=list)
+    # Every real tool result fetched anywhere in this conversation so far --
+    # must travel with the conversation the same way history does, or a
+    # follow-up turn loses grounding for facts fetched in an earlier turn
+    # (ERROR_ANALYSIS.md Entry 5).
+    tool_records: list[ToolCallRecord] = field(default_factory=list)
+
+
+_conversations: dict[str, _ConversationState] = {}
 
 
 class ChatRequest(BaseModel):
@@ -54,10 +67,14 @@ class ChatResponse(BaseModel):
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
     conversation_id = request.conversation_id or str(uuid.uuid4())
-    history = _conversations.get(conversation_id, [])
+    state = _conversations.get(conversation_id, _ConversationState())
 
-    result = _agent.run_turn(history, request.message, request.patient_id)
-    _conversations[conversation_id] = result.updated_history
+    result = _agent.run_turn(
+        state.history, request.message, request.patient_id, state.tool_records
+    )
+    _conversations[conversation_id] = _ConversationState(
+        history=result.updated_history, tool_records=result.accumulated_tool_records
+    )
 
     return ChatResponse(
         conversation_id=conversation_id,

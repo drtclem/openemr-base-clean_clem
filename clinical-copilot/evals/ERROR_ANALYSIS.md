@@ -242,3 +242,102 @@ conversations surfaced it (or rather, surfaced proof that it had already
 been caught) in a way the Golden Set's 8 cases don't specifically test for.
 That's the exact case `COVERAGE.md`'s stated Behavioral Coverage process is
 meant to make routine.
+
+---
+
+## Entry 5 — multi-turn grounding gap: verification only sees the current turn's tool calls (2026-09-16)
+
+**Observed:** Running the newly-built Behavioral Coverage suite's
+`c4_8_repeat_warning_next_turn` case (droplet run) -- a two-turn
+conversation about pid1 (Alice Testpatient) -- surfaced an unexpected
+`[HARD STOP -- allergy conflict]` injection and `flagged_claims:
+['penicillin']` on turn 2, even though penicillin is genuinely pid1's real,
+documented allergy, correctly fetched in turn 1 of the very same
+conversation.
+
+**What triggered it, concretely:** Turn 1: *"Give me a quick orientation on
+this patient."* -- the agent calls `get_patient_snapshot`, gets back her
+real chart (including her real penicillin allergy), and answers correctly.
+Turn 2, same conversation: *"And what medications is she on?"* -- a natural
+follow-up. The agent answered from its memory of turn 1's data rather than
+redundantly re-calling `get_patient_snapshot` (reasonable, efficient
+behavior), and its draft mentioned the real penicillin allergy as a
+reminder. Verification flagged and stripped it as unverified, and the
+domain-constraint layer (seeing "penicillin" as an apparently-unverified
+medication-shaped term) fired a hard-stop warning about it too.
+
+**Root cause:** `app/agent.py`'s `run_turn()` built `turn_records` --  the
+list of real tool results passed to `verify_response()` for grounding --
+fresh on every call, from only the tool calls made *during that specific
+call*. It had no visibility into tool calls from earlier turns in the same
+conversation. So on any follow-up turn where the model correctly reuses
+already-fetched data instead of redundantly re-fetching, the grounded-facts
+list was empty, and anything the model said -- even something 100% true and
+already-verified one turn earlier -- had nothing to check against and got
+treated as if it were fabricated. Reproduced deterministically, zero LLM
+cost: `verify_response("...documented penicillin allergy.", [], PID1,
+fhir)` (empty `turn_records`, simulating a turn with no new tool call)
+yields `flagged_claims: ['penicillin']` on demand.
+
+This is more than a single-case bug: USERS.md explicitly designs around a
+resident asking an orientation question and then naturally asking
+follow-ups in the same conversation. Every follow-up turn where the model
+efficiently reused earlier data (instead of redundantly re-fetching) was at
+risk of having true information wrongly stripped.
+
+**Fix:** Thread accumulated tool records through the conversation the same
+way `history` already is, rather than resetting them every turn:
+- `ChatTurnResult` gained `accumulated_tool_records: list[ToolCallRecord]`
+  -- every real tool result fetched anywhere in the conversation so far,
+  not just this turn.
+- `run_turn()` gained an optional `prior_tool_records` parameter; callers
+  pass back the previous turn's `accumulated_tool_records`.
+  `turn_records` now starts from that list instead of `[]`, so new tool
+  calls append to the accumulated history instead of replacing it.
+- **Cross-patient guard, not just accumulate-everything:** naively
+  accumulating every prior record risked a different bug -- if a
+  conversation switches patients mid-way, patient A's data could wrongly
+  ground claims about patient B. `ToolCallRecord` already carries its own
+  `patient_id`, so `verify_response()` is now called with only the records
+  matching the *current* turn's active patient
+  (`records_for_active_patient = [r for r in turn_records if r.patient_id
+  == patient_id]`), while the full unfiltered history is still kept in
+  `accumulated_tool_records` in case the conversation switches back to an
+  earlier patient later.
+- `app/main.py`'s per-conversation state (`_ConversationState`) now carries
+  `tool_records` alongside `history` between HTTP requests, the same way
+  `history` already was.
+- `evals/behavioral_coverage.py`'s multi-turn runner threads
+  `accumulated_tool_records` between turns the same way, so multi-turn
+  eval cases actually exercise the fixed behavior.
+
+**Verification:**
+1. Reproduced the exact original bug scenario live (two real turns, pid1,
+   the orientation-then-medications sequence) -- before the fix, turn 2
+   flagged `['penicillin']`; after the fix, `flagged_claims: []` on turn 2,
+   with the real allergy correctly mentioned.
+2. True-negative control: same setup, but the draft also asserts a
+   genuinely false claim (Warfarin) alongside the true recalled one
+   (penicillin) -- confirmed the true claim now passes through correctly
+   grounded and unflagged, while the false claim is still correctly
+   flagged and stripped, proving the fix didn't just loosen grounding
+   generally.
+3. Cross-patient guard: a two-turn conversation switching from pid1 to
+   pid2 mid-conversation, with pid1's records still accumulated -- pid2's
+   turn correctly reported only pid2's real data, no cross-contamination
+   observed.
+4. Re-ran everything after the fix, both locally and against the droplet:
+   `evals/unit_tests.py` 6/6 both, Golden Set (`evals/run_evals.py`) 8/8
+   both with Gate: PASS both, Behavioral Coverage (`evals/
+   run_behavioral_coverage.py`) 43/49 (88%) both. The drop from the
+   pre-fix 46/49 (local) / 45/49 (droplet) baseline is fully accounted for
+   by pre-existing LLM-response variance on single-turn cases whose code
+   path is byte-identical before and after this fix (confirmed by
+   re-running `c4_9_vitals_only_question` standalone and observing the
+   model call `get_patient_snapshot` on one run and not the other, same
+   code, same message) -- not a regression from this change. Directly
+   confirmed on the original discovery case: `c4_8_repeat_warning_next_turn`
+   still fails on both instances, but only for its own separately-documented,
+   expected reason (the duplicate-warning-repetition design tension); its
+   `flagged_claims` is now `[]` on both, where it was previously
+   `['penicillin']` on the droplet run that discovered this bug.

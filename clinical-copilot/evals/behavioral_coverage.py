@@ -58,11 +58,13 @@ class BehavioralCase:
 
 def run_behavioral_case(agent: ClinicalCopilotAgent, case: BehavioralCase) -> list[ChatTurnResult]:
     history: list[dict] = []
+    tool_records = []
     results: list[ChatTurnResult] = []
     for message in case.messages:
-        result = agent.run_turn(history, message, case.patient_id)
+        result = agent.run_turn(history, message, case.patient_id, tool_records)
         results.append(result)
         history = result.updated_history
+        tool_records = result.accumulated_tool_records
     return results
 
 

@@ -97,6 +97,13 @@ class ChatTurnResult:
     enforced_warnings: list[str]
     tool_calls: list[dict] = field(default_factory=list)
     updated_history: list[dict] = field(default_factory=list)
+    # Every real tool result fetched so far THIS CONVERSATION (prior turns'
+    # plus this turn's), not just this turn's. A caller that wants grounding
+    # to see facts fetched in earlier turns (e.g. a follow-up question
+    # answered from an earlier snapshot without re-fetching) must pass this
+    # back in as run_turn()'s prior_tool_records on the next call -- see
+    # that parameter's docstring for why (ERROR_ANALYSIS.md Entry 5).
+    accumulated_tool_records: list[ToolCallRecord] = field(default_factory=list)
 
 
 class ClinicalCopilotAgent:
@@ -111,7 +118,16 @@ class ClinicalCopilotAgent:
         history: list[dict],
         user_message: str,
         patient_id: str | None,
+        prior_tool_records: list[ToolCallRecord] | None = None,
     ) -> ChatTurnResult:
+        """prior_tool_records: every real tool result fetched in EARLIER turns
+        of this same conversation (pass back the previous ChatTurnResult's
+        accumulated_tool_records). Without this, verify_response() can only
+        ground a claim against tool calls made in the CURRENT turn -- so a
+        follow-up question the model correctly answers from an earlier
+        fetch, without redundantly re-calling the tool, gets its true,
+        already-grounded claim wrongly flagged as unverified. See
+        ERROR_ANALYSIS.md Entry 5."""
         correlation_id = str(uuid.uuid4())
         trace = self._observer.start_turn(correlation_id, user_message, patient_id)
 
@@ -126,7 +142,7 @@ class ClinicalCopilotAgent:
             content_for_model = f"[Active patient context: patient_id={patient_id}]\n\n{user_message}"
 
         messages = list(history) + [{"role": "user", "content": content_for_model}]
-        turn_records: list[ToolCallRecord] = []
+        turn_records: list[ToolCallRecord] = list(prior_tool_records) if prior_tool_records else []
         tool_call_log: list[dict] = []
 
         for round_index in range(MAX_TOOL_ROUNDS):
@@ -194,7 +210,13 @@ class ClinicalCopilotAgent:
                 "the allowed number of tool calls. Please try a narrower question."
             )
 
-        outcome = verify_response(draft_text, turn_records, patient_id, self._fhir)
+        # Ground against records for the ACTIVE patient only. turn_records may
+        # include earlier turns' fetches for a different patient_id if the
+        # conversation switched patients -- those must not ground claims about
+        # the current patient (accumulated_tool_records below still keeps the
+        # full history, in case the conversation switches back later).
+        records_for_active_patient = [r for r in turn_records if r.patient_id == patient_id]
+        outcome = verify_response(draft_text, records_for_active_patient, patient_id, self._fhir)
         trace.log_verification(
             passed_source_attribution=outcome.passed_source_attribution,
             passed_domain_constraint=outcome.passed_domain_constraint,
@@ -214,6 +236,7 @@ class ClinicalCopilotAgent:
             enforced_warnings=outcome.enforced_warnings,
             tool_calls=tool_call_log,
             updated_history=messages,
+            accumulated_tool_records=turn_records,
         )
 
     def _call_tool(self, name: str, tool_input: dict):
