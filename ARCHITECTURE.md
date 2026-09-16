@@ -278,14 +278,86 @@ code first.
 
 ## 7.7 Alert definitions
 
-Three alerts, defined in Langfuse (or as simple threshold checks against its logged data if native
-alerting is insufficient), each with a stated on-call response:
+**Status: live, not just designed.** Self-hosted Langfuse (v4.36.1) ships a real, DB-backed
+**Monitor** feature -- not an Enterprise-only add-on -- that evaluates a metric query on a rolling
+window every ~1 minute and transitions a severity state (`OK` / `WARNING` / `ALERT`) when a
+threshold is crossed. Confirmed directly against both running instances (not assumed): three
+Monitors exist in the `clinical-copilot-dev` project on **each** of the local and droplet Langfuse
+deployments (each self-hosted instance has its own independent Postgres/ClickHouse, so this is two
+separate configurations, not one shared across both), each wired to a real Automation/Action so
+severity changes are a genuine event, not just a number sitting in a table.
 
-| Alert | Threshold | On-call response |
-|---|---|---|
-| p95 latency | exceeds target for the relevant use case (Section 6 acknowledges this varies; the rapid-response use case has the tightest bound) | Check `/ready` first to isolate which dependency is slow, then check Langfuse traces for the specific slow step |
-| Error rate | exceeds a set threshold over a rolling window | Check recent tool failure logs first; correlate against OpenEMR/API status before assuming an agent-side bug |
-| Tool failure rate | exceeds a set threshold | Check whether it's isolated to one tool (likely a schema mismatch, 7.3) or across all tools (likely OpenEMR/network-level, escalate to infrastructure) |
+| Alert | Real threshold | Window | Plain-language meaning | Solo on-call response |
+|---|---|---|---|---|
+| p95 latency | `p95(latency)` on observations where `type = AGENT` (the whole `chat_turn` span) **> 20,000 ms local / > 30,000 ms droplet** | rolling 15 min | The slowest 5% of resident-facing turns are taking longer than the instance's threshold, end to end | Check `/ready` first to isolate which dependency is slow (OpenEMR FHIR, Anthropic, Langfuse), then open the specific slow trace in Langfuse to see which step -- an LLM call round, a tool call, or verification -- is eating the time |
+| Error rate | `count` of observations where `level = ERROR` **> 3** | rolling 15 min | More than 3 failed operations of any kind happened recently | Look at which observations are `ERROR` in Langfuse; today this is populated exclusively by tool-call failures (see gap below), so correlate against OpenEMR/Anthropic status before assuming a code bug |
+| Tool failure rate | `count` of observations where `type = TOOL AND level = ERROR` **> 3** | rolling 30 min | More than 3 tool calls (the FHIR-backed `get_patient_snapshot` / `check_allergy_conflict`) failed recently | Check whether failures cluster on one tool/input shape (e.g. repeated malformed patient IDs -- expected, not urgent) or spread across many real requests (FHIR/network-level, escalate) |
+
+**Where the p95 thresholds came from:** `USERS.md` use case 3 states the rapid-response scenario
+needs an answer "in seconds, not minutes" but names no exact number, so both thresholds were chosen
+from real measured data rather than guessed -- and the two instances needed *different* numbers,
+which is itself a finding worth recording. Querying every real `AGENT`-type observation recorded
+directly in each instance's own ClickHouse to date:
+
+- **Local** (677 real traces): p50 ≈ 7.95 s, p95 ≈ 12.47 s, max ≈ 18.4 s → threshold set to 20 s.
+- **Droplet** (218 real traces): p50 ≈ 12.82 s, p95 ≈ 19.72 s, max ≈ 25.82 s → threshold set to 30 s.
+
+The droplet is measurably slower across the board (consistent with its more modest resources,
+the same pattern already documented for the `/ready` OpenEMR check's own dedicated timeout above);
+using the local threshold on the droplet would have put its real p95 within striking distance of
+"alert," which is not a meaningful signal. Each threshold sits comfortably above that instance's own
+observed max so it does not fire on ordinary variance, while still catching a genuine regression
+(e.g. the droplet resource-contention incident already logged in `COVERAGE.md`). It is also an
+honest admission that the *current* system does not yet hit an idealized "few seconds" bound for its
+tightest use case -- the multi-round tool-calling + verification design (Section 3) has a real
+latency floor around 8-13 s median today, worse on the droplet; closing that gap is future work, not
+something to paper over here.
+
+**Why error rate and tool failure rate will show identical numbers right now:** confirmed by reading
+`app/observability.py` directly -- `finish_tool_call()` is the *only* place that sets
+`level="ERROR"` on a Langfuse observation. LLM generation spans (`start_llm_call` /
+`finish_llm_call`) never get marked `ERROR` even if the underlying Anthropic call fails, and there is
+no span-level error marking for an unhandled exception inside `/chat` itself. So today, every
+`ERROR`-level observation is a tool failure, and the two alerts are deliberately scoped differently
+(all types vs. `type = TOOL` only, plus different windows) so they *will* diverge once other error
+sources get instrumented -- not invented to look distinct before they actually are.
+
+**Notification channel, and its one real limitation:** each Monitor is linked to a Langfuse
+Automation whose Action is type `WEBHOOK` (self-hosted Langfuse's alerting supports Webhook, Slack,
+or GitHub Dispatch -- no native "email me" option; Slack would need a connected workspace not set up
+for this solo project). Self-hosted Langfuse hard-codes its webhook validator to only allow target
+port 80 or 443 (SSRF hardening, not configurable via env), and this project's own `/chat` service
+runs on 8420 with no port-80/443 listener in front of it, so the configured webhook target
+(`https://example.com/clinical-copilot-alerts`) is a placeholder that satisfies Langfuse's
+"a Monitor needs at least one Automation" requirement but does not actually deliver anywhere. Per
+this task's own explicit allowance for a solo-operator deployment, the real, live, checkable
+notification target is **the Monitor's own state** -- `severity` and `alertedAt`, visible in
+Langfuse's Alerts UI (`/project/clinical-copilot-dev/alerts`) and queryable via its API -- not the
+webhook payload. Wiring real webhook delivery (a small reverse proxy on 80/443, or rebinding the
+service) is a near-term next step, not done here, noted honestly rather than silently claimed.
+
+**Proof it actually fires (2026-09-16, local instance), not just configured:**
+- **Tool failure rate** and **Error rate** fired for real, with no threshold trick: 5 real
+  malformed-patient-ID requests were sent to the live local `/chat` endpoint back to back. The
+  scheduler's next tick (≤1 minute later, per Langfuse's own cadence for sub-day windows) picked up
+  the 5 real `ERROR`-level tool observations and flipped both Monitors from `OK` to `ALERT`
+  (`tool failure rate` at `22:12:08Z`, `error rate` at `22:12:38Z`), with `alertedAt` populated.
+- **p95 latency** was proven by the threshold-lowering method instead (real traffic wasn't slow
+  enough to trip 20,000 ms honestly): temporarily set `alertThreshold` to 100 ms via the Monitor's
+  own update API, confirmed `severity` flip to `ALERT` within one scheduler tick, then restored
+  `alertThreshold` to 20,000 and confirmed `severity` returned to `OK` on the following tick --
+  full fire-then-recover cycle observed, not asserted.
+- The two failure-driven alerts (`tool failure rate`, `error rate`) are expected to self-clear back
+  to `OK` on their own once the 5 manufactured failures age out of their rolling windows (30 min and
+  15 min respectively from `22:12Z`) -- no manual reset needed, which is itself a confirmation the
+  rolling-window logic works as designed.
+
+The same three Monitors were separately created on the **droplet** instance (its own Langfuse, its
+own trigger IDs, its own 30,000 ms latency threshold per its own measured baseline above) and
+confirmed evaluating against real droplet ClickHouse data within one scheduler tick of creation
+(`severity: OK`, real `lastCompletedAt` timestamps). The fire-then-recover mechanism itself was
+proven once, thoroughly, on local; it is the same Langfuse code path on both instances, so it was
+not separately re-triggered on the droplet to avoid manufacturing needless load there.
 
 ## 7.8 Baseline CPU/memory/latency/throughput
 
