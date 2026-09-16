@@ -15,13 +15,17 @@ Usage:
 
 from __future__ import annotations
 
+import datetime
 import logging
 import sys
 import time
+from pathlib import Path
 
 from evals.run_behavioral_coverage import run_behavioral_suite
 from evals.run_evals import check_gate, run_golden_set
 from evals.unit_tests import run_all_tests
+
+HISTORY_LOG_PATH = Path(__file__).parent / "run_history.log"
 
 # app/observability.py's structured per-event JSON logging (every llm_call /
 # tool_call / verification / turn event) is genuinely useful when running a
@@ -114,6 +118,19 @@ def main() -> int:
         print(f"  {i}. {title} ({evidence})")
     print("=" * 62)
     print(f"\nTotal run time: {elapsed_min:.1f} min")
+
+    # Append-only permanent record, distinct from last_run_results.json /
+    # last_behavioral_run_results.json (both regenerated-every-run, gitignored).
+    # Pulled from the exact same variables already used for the printed
+    # summary above, not re-derived.
+    timestamp = datetime.datetime.now().isoformat(timespec="seconds")
+    history_line = (
+        f"{timestamp}  unit={unit_passed}/{unit_total}  "
+        f"golden={golden_passed}/{golden_total}(gate:{'PASS' if gate_passed else 'BLOCKED'})  "
+        f"behavioral={behavioral_passed}/{behavioral_total}({behavioral_pct}%)\n"
+    )
+    with open(HISTORY_LOG_PATH, "a") as f:
+        f.write(history_line)
 
     all_gated_passed = (unit_passed == unit_total) and (golden_passed == golden_total) and gate_passed
     return 0 if all_gated_passed else 1
