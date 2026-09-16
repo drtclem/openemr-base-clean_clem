@@ -3,8 +3,10 @@
 ## Two-tier testing strategy
 
 - **`evals/unit_tests.py`** -- fast, deterministic, zero Anthropic API calls
-  (real FHIR calls only). Runs automatically on every push to `main`
-  (`.github/workflows/tests.yml`). Regression safety net for the tools
+  (real FHIR calls only). Not currently auto-triggered on push -- GitHub
+  Actions' network can't reach the droplet (see `ERROR_ANALYSIS.md` Entry 3);
+  run manually (`python3 -m evals.unit_tests`) or via `workflow_dispatch`
+  until that's resolved. Regression safety net for the tools
   (`get_patient_snapshot`, `check_allergy_conflict`) and `verification.py`'s
   stripping logic, independent of whether the model behaves well on any
   given day. Free and instant, so there's no reason not to run it constantly.
@@ -19,6 +21,62 @@ commit; the LLM suite is the one that actually answers "does the agent
 behave correctly," which needs a real model call and therefore real cost, so
 it's reserved for the moments that matter (pre-deploy, after a prompt or
 verification change).
+
+## Golden Set vs. Behavioral Coverage
+
+The current 8 LLM-based cases in `evals/cases.py` are, by definition, a
+**Golden Set**: small, every case expected to pass, correctness-focused --
+each one pins down a specific known fact, invariant, or prior finding, and a
+failure means something genuinely broke. This is deliberately not yet
+**Behavioral Coverage**: a much broader set (30-100+ cases) where not every
+case is expected to pass, run per-release rather than per-commit, meant to
+surface *patterns* of weakness across many phrasings/scenarios rather than
+confirm specific correctness. The two serve different jobs -- a Golden Set
+answers "did we break something we already know works," Behavioral Coverage
+answers "where does the agent's behavior actually get shaky across the
+long tail," and a small Golden Set alone can't answer the second question.
+
+**This is a named next step for Final Submission, not an oversight.**
+Building the 30-100 actual behavioral cases is out of scope for today --
+this section exists to document the distinction and commit to the plan, not
+to implement it. When it's built, the eval runner's terminal output (see
+below) already has a dedicated "Behavioral Coverage" section ready to report
+its results as a second, separately-interpreted number once real cases
+exist.
+
+## Near-term next steps
+
+Both deferred deliberately (2026-09-16), not oversights -- noted here with
+enough specificity to pick back up without re-deriving the plan.
+
+**Behavioral Coverage** (above): design and write 30-100 cases spanning a
+much wider range of phrasings and scenarios per USERS.md use case, run
+per-release rather than per-commit, evaluated for *patterns* of weakness
+rather than pass/fail correctness.
+
+**Langfuse Datasets/Experiments wiring:** register the Golden Set's 8 cases
+as a persisted Langfuse Dataset (one item per case, keyed by case name for
+idempotent re-creation) so pass-rate history becomes a visible trend across
+runs in the Langfuse UI (Datasets/Experiments in the sidebar), not just a
+single terminal snapshot each time. Confirmed feasible via the real SDK
+(`Langfuse.run_experiment(name, data, task, evaluators)` exists precisely
+for this), not a stretch. The concrete plan:
+- One-time setup: `create_dataset` + `create_dataset_item` per case.
+- Restructure `run_evals.py` so `run_experiment`'s `task` callback *is* the
+  actual execution path (runs the agent turn) -- not a second parallel run
+  invoked alongside the existing loop, which would silently double the real
+  Anthropic spend per eval run.
+- `evaluators`: a small adapter wrapping each case's existing `check()`
+  function (which expects a `ChatTurnResult`-shaped object) so it plugs into
+  the evaluator's `(input, output, expected_output, metadata)` signature
+  unchanged, returning an `Evaluation(name=..., value=passed, comment=reason,
+  data_type="BOOLEAN")`.
+- Terminal reporting continues to read from `run_experiment`'s returned
+  `ExperimentResult.item_results` (which carries `.output` and
+  `.evaluations` per item) rather than a separately-computed list, so the
+  two reporting paths (terminal + Langfuse) stay backed by one execution.
+- Verification requires one real, full-cost 8-case run against each target
+  (local + droplet), same as any other change to `run_evals.py`.
 
 ## LLM-based eval case matrix
 

@@ -112,12 +112,22 @@ tests.yml`'s automatic `push` trigger was removed (kept as
 unit suite goes back to fully manual (`python3 -m evals.unit_tests`) for
 now, same as the LLM-based eval suite already is.
 
-**Flagged next step, with its tradeoff:** a self-hosted GitHub Actions
-runner installed directly on the droplet would sidestep the external-
-reachability question entirely -- the runner would hit `localhost:8300`/
-`9300`, exactly like this session's own successful SSH-based testing did
-throughout. The tradeoff: a self-hosted runner means GitHub-orchestrated
-code execution happens directly on a machine that also runs the droplet's
-real (if fixture) OpenEMR/Langfuse services, which is a materially larger
-trust boundary than GitHub's own ephemeral hosted runners -- worth deciding
-deliberately, not defaulting into, before Final Submission.
+**Options considered:**
+1. **Contact DigitalOcean support** and ask directly whether they're
+   dropping traffic from GitHub Actions' IP ranges to this droplet -- they
+   have edge-level visibility this investigation doesn't. Not yet done.
+2. **Self-hosted GitHub Actions runner on the droplet itself** -- sidesteps
+   the external-reachability question entirely, since the runner would hit
+   `localhost:8300`/`9300` directly, exactly like this session's own
+   successful SSH-based testing did throughout. Tradeoff: a self-hosted
+   runner means GitHub-orchestrated code execution happens directly on a
+   machine that also runs the droplet's real (if fixture) OpenEMR/Langfuse
+   services -- a materially larger trust boundary than GitHub's own
+   ephemeral hosted runners, worth deciding deliberately, not defaulting
+   into.
+3. **Keep the unit suite manually-triggered** (`python3 -m evals.unit_tests`
+   / `workflow_dispatch`), same as the LLM-based eval suite already is --
+   loses "runs safely on every commit for free," but requires no further
+   infrastructure work. **This is the current state**, chosen deliberately
+   to unblock today's demo-video work, not because options 1-2 were ruled
+   out -- either remains available as a near-term follow-up.

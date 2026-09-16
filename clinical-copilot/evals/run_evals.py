@@ -62,17 +62,28 @@ def main() -> int:
 
     total = len(results)
     passed_count = sum(1 for r in results if r["passed"])
+    pct = round(100 * passed_count / total) if total else 0
 
     print(f"\n{'=' * 70}")
-    print(f"Clinical Co-Pilot eval suite: {passed_count}/{total} passed")
+    print("Golden Set vs. Behavioral Coverage -- see evals/COVERAGE.md")
+    print(f"{'=' * 70}")
+    print(f"Golden Set:          {passed_count}/{total} passed ({pct}%)")
+    print("Behavioral Coverage:  not yet implemented (see evals/COVERAGE.md)")
     print(f"{'=' * 70}\n")
+
     for r in results:
         status = "PASS" if r["passed"] else "FAIL"
         print(f"[{status}] {r['name']} ({r['category']}) -- {r['elapsed_s']}s")
         print(f"       guards against: {r['guards_against']}")
         print(f"       reason: {r['reason']}")
         if not r["passed"]:
-            print(f"       response was: {r['response_text']!r}")
+            # Full concrete situation on every failure, not just the reason:
+            # exactly what was sent, to which patient, and what came back.
+            print(f"       patient_id: {r['patient_id']!r}")
+            print(f"       message sent: {r['message']!r}")
+            print(f"       response received: {r['response_text']!r}")
+            if r["error"]:
+                print(f"       exception: {r['error']}")
         print()
 
     out_path = Path(__file__).parent / "last_run_results.json"
