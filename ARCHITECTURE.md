@@ -260,8 +260,53 @@ open-source (MIT) self-hosted deployment requires no purchase and no new vendor 
 all, it is software running on infrastructure already approved and already paying for. Braintrust
 has no equivalent self-host path once usage exceeds its free tier, which would force a vendor
 question this project doesn't need to raise. Tracks, at minimum: request count, error count,
-p50/p95 latency, tool call counts, retry counts, and verification pass/fail rate (the North Star
-metric from `KEY_METRICS.md`), satisfying the dashboard requirement with a single tool.
+p50/p95 latency, tool call counts, and verification pass/fail rate (the North Star metric from
+`KEY_METRICS.md`), satisfying the dashboard requirement with a single tool. (Retry counts, listed
+here in earlier drafts, is dropped below -- no retry logic exists anywhere in this system today, so
+there is nothing for that metric to count; see the status note immediately below for why.)
+
+### Dashboard requirement status (confirmed 2026-09-16, not assumed)
+
+**Confirmed live and covered, on both instances.** Langfuse ships a built-in, non-custom
+`Langfuse Agent Dashboard` (owner: `LANGFUSE`, a stock template, not something this project built)
+-- confirmed present via its API on both the local and droplet instances. Its 8 widgets: Total Tool
+Calls, Total Tool Calls (over time), Top 20 Called Tools, Observations by Type, P95 Tool Latency by
+Tool, P95 Tool Latency by Tool (over time), P95 Latency by Observation Type, and Tool Errors by
+Tool. Combined with the three verification scores (`verification_pass_rate`,
+`source_attribution_pass`, `domain_constraint_pass`) confirmed actually logged on every real trace
+-- 682/681/681 scored entries on local, 218/218/218 on the droplet, queried directly from each
+instance's own ClickHouse rather than assumed -- this covers the PRD's required minimum floor:
+request count, error count, p50/p95 latency, tool call counts, and verification pass/fail rate.
+
+**Queue depth: not applicable.** The current architecture is a single FastAPI process handling each
+`/chat` request synchronously and directly (§1.2's single-agent design) -- there is no request
+queue anywhere in front of it, so there is no "depth" for any metric to measure. This would become a
+real, meaningful metric if the system moves to a queued/async request-handling model at higher
+scale -- `COST_ANALYSIS.md`'s 10,000-user tier already names horizontal scaling of the service
+behind a load balancer as a required architecture change at that volume, and a queue is a natural
+component of that kind of redesign, though the cost doc doesn't name "queueing" explicitly itself.
+This is future-architecture territory, not a gap in the current single-process design.
+
+**Event retries: not applicable.** Confirmed directly in the code (`grep` across every file in
+`app/`, plus `requirements.txt`) -- no retry logic exists anywhere: not around tool calls, not
+around FHIR requests, not around LLM calls. Failures are surfaced directly to the resident rather
+than retried automatically, matching §4's failure-mode table exactly (`state the gap directly...
+never answer as if data was retrieved when it wasn't`) -- a deliberate current design choice, not an
+oversight. One honest caveat: the Anthropic Python SDK itself applies its own default
+transport-level retry (a small number of automatic retries on transient network/5xx errors) to LLM
+calls specifically, since `app/agent.py` never overrides `max_retries` on the client -- this is
+vendor-SDK behavior we haven't disabled, not application-level retry logic we built, and it does not
+apply to the FHIR client (`httpx`, no retry behavior by default). A retry-count metric would become
+meaningful if application-level retry logic is added later.
+
+**What actually matters most here.** The PRD's dashboard requirement is a stated minimum floor, not
+a ceiling -- it explicitly expects a team to add whatever metrics matter for their specific agent
+design. For this design, that metric is `verification_pass_rate`: the one named in `KEY_METRICS.md`
+as the North Star specifically because it is the most direct measurement of this project's actual
+premise (a confidently wrong clinical answer is the failure this whole system exists to prevent).
+It is also, of everything in this section, the metric that is real, live, and proven working
+end-to-end multiple times over today -- the Warfarin hallucination-bait case and the stale
+sign-out/duplicate-record case among them -- not just present in a dashboard widget.
 
 ## 7.5 Runnable API collection
 
