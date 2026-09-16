@@ -95,16 +95,60 @@ CouchDB / Mailpit were **not** running, so nothing needed stopping this time (un
 | Peak container memory | `langfuse-web` 981 MiB, `openemr` 824 MiB, `clickhouse` 801 MiB, `langfuse-worker` 626 MiB |
 | Our own service (`uvicorn`, host process) | Peak 0.8% CPU, ~79 MB RSS |
 
-**50 concurrent users — deliberately skipped, stated honestly.** The 10-user droplet result
-already shows severe degradation relative to both the local result and the droplet's own
-single-user baseline (ARCHITECTURE.md §7.7's measured p50≈12.8s/p95≈19.7s/max≈25.8s from 218 real
-traces) — median latency alone (81s) is already 4-6x the droplet's normal single-user experience,
-and `clickhouse` alone is consuming more CPU than one full core on this 2-vCPU box. Scaling to 50
-concurrent users on top of that would almost certainly produce multi-minute waits or outright
-timeouts without teaching us anything the 10-user result hasn't already shown, while risking real
-disruption to the shared droplet's other workloads (it also runs the actual OpenEMR dev stack) for
-no added diagnostic value. This is a judgment call, stated plainly rather than silently
-substituting a smaller number as if it were the full test.
+**50 concurrent users — deliberately skipped at the time, stated honestly.** The 10-user droplet
+result above already showed severe degradation relative to both the local result and the droplet's
+own single-user baseline (ARCHITECTURE.md §7.7's measured p50≈12.8s/p95≈19.7s/max≈25.8s from 218
+real traces) — median latency alone (81s) was already 4-6x the droplet's normal single-user
+experience, and `clickhouse` alone was consuming more CPU than one full core on this 2-vCPU box.
+Scaling to 50 concurrent users on top of that would almost certainly have produced multi-minute
+waits or outright timeouts without teaching us anything the 10-user result hadn't already shown,
+while risking real disruption to the shared droplet's other workloads (it also runs the actual
+OpenEMR dev stack) for no added diagnostic value. That was a judgment call, stated plainly rather
+than silently substituting a smaller number as if it were the full test — and it was revisited once
+the underlying constraint changed (see below), not left as a permanent gap.
+
+### Stage 3, continued — 50 concurrent users, after the droplet resize (2026-09-16, later same evening)
+
+Once the droplet was resized 2 vCPU/4GB → 4 vCPU/8GB (ERROR_ANALYSIS.md Entry 6) and the 10-user
+stage was re-verified there, the originally-skipped 50-user droplet stage was run for real:
+
+| Metric | Value |
+|---|---|
+| Requests | 105 (50 orientation, 50 follow-up, 5 malformed-ID) |
+| Error rate | 0 / 105 (0%) |
+| Throughput | 0.70 req/s sustained |
+| p50 / p95 / p99 latency (aggregate) | 59.0s / 83.0s / 107.0s |
+| p50 / max — orientation | 75.0s / 107.68s |
+| p50 / max — follow-up | 54.0s / 78.91s |
+| Peak container CPU | `openemr-1` **338.6%** (near-saturating all 4 cores by itself), `clickhouse` 120.4%, `langfuse-web` 92.3%, `langfuse-worker` 67.6% |
+| Peak container memory | `openemr` 2.68 GiB, `clickhouse` 1.10 GiB, `langfuse-web` 1009 MiB, `langfuse-worker` 788 MiB |
+| Our own service (`uvicorn`, host process) | Peak 1.8% CPU, ~104 MB RSS |
+
+**Cross-checked against the new `request_timing.log` and Langfuse's own `AGENT`-span data** (same
+method as the Entry 6 verification): all three sources agree closely for these same 105 real
+requests --
+
+| Source | p50 | p95 | max | count vs. real requests |
+|---|---|---|---|---|
+| Locust (ground truth) | 59.0s | 83.0s | 107.68s | 105/105 |
+| Langfuse `AGENT`-span | 51.2s | 80.5s | 82.2s | **105/105** |
+| `request_timing.log` | 58.6s | 83.1s | 107.66s | 105/105, mean 58.96s vs. Locust's own mean 58.98s |
+
+The observability fix holds at 50 concurrent users too, not just the 10-user case it was verified
+against -- both independent sources continue to track the real client-observed latency closely.
+
+**Reading the result honestly:** the resize resolved the *observability* gap completely, but 50
+concurrent users is still genuinely heavy load for this box -- `development-easy-openemr-1` alone
+now peaks at 338.6% CPU, close to saturating all four cores by itself, and p95 latency (83s) is
+roughly 4x the droplet's single-user baseline (19.7s). This is worse than local's 50-user result
+(p95 61.0s, Stage 2 above) on the same relative concurrency, consistent with the droplet remaining
+a smaller, shared box even after the resize. All three configured alerts correctly fired on this
+run (`p95 latency`, `error rate`, `tool failure rate` all `ALERT`) -- the latter two legitimately,
+since the 5 deliberate malformed-ID requests in this run are real tool failures by design, not a
+bug, and exceeded the `>3` threshold as expected. Nothing here suggests scaling to 50 concurrent
+droplet users is currently viable without the same infrastructure changes (caching, bulk-export,
+eventually horizontal scaling) already named in ARCHITECTURE.md §6 -- consistent with, not
+contradicting, the local Stage 2 finding.
 
 ## A significant finding this load test surfaced, not smoothed over
 
