@@ -1,18 +1,18 @@
 name: Clinical Co-Pilot unit tests
 
-# Runs ONLY the fast, LLM-free unit test suite (evals/unit_tests.py) on every
-# push to main. The 8 LLM-based eval cases in evals/cases.py are NOT run
-# here -- they cost real Anthropic API spend per run, so they stay
-# manually-triggered (`python3 -m evals.run_evals`) before deploys, not on
-# every commit. See clinical-copilot/evals/COVERAGE.md's "two-tier testing
-# strategy" section.
+# NOT currently auto-triggered on push -- see ERROR_ANALYSIS.md's
+# "GitHub Actions cannot reach the droplet" entry (2026-09-16). GitHub's
+# runners can't reach the droplet's OpenEMR on either port (confirmed not a
+# TLS/cert issue, not ufw, not a DO Cloud Firewall -- something upstream of
+# the droplet), so an auto-triggered run here would just fail every push.
+# Until that's resolved (self-hosted runner on the droplet is the leading
+# option), this suite is manually run (`python3 -m evals.unit_tests`) or
+# manually dispatched here via workflow_dispatch, same as the 8 LLM-based
+# eval cases in evals/cases.py already are (those additionally cost real
+# Anthropic API spend per run, so stay manual regardless -- see
+# clinical-copilot/evals/COVERAGE.md's "two-tier testing strategy" section).
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "clinical-copilot/**"
-      - ".github/workflows/tests.yml"
   workflow_dispatch: {}
 
 jobs:
