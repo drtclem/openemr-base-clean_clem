@@ -104,6 +104,48 @@ deliverable -- the suite code is the deliverable). Each case documents its
 category (boundary / invariant / regression / adversarial, per
 `ARCHITECTURE.md` 7.1) and the specific failure mode it guards against.
 
+## Bruno API collection
+
+`bruno/` is a [Bruno](https://www.usebruno.com/) collection covering
+`/health`, `/ready`, and 7 proven `/chat` scenarios pulled directly from
+the Golden Set / behavioral coverage work, for manual poking at either
+instance without writing curl by hand.
+
+Open the `bruno/` folder in the Bruno app, pick an environment (`local` =
+`http://localhost:8420`, `droplet` = `http://157.230.11.142:8420`), and
+run any request. Each request's `docs` tab explains what the scenario is
+proving and what a correct response looks like.
+
+**Environments:**
+- `local` — talks straight to a `uvicorn` instance on the host.
+- `droplet` — points at the droplet's public IP. Note: the droplet's
+  `uvicorn` is bound to `127.0.0.1` only and port 8420 is not opened in
+  `ufw`, so this environment is not externally reachable as configured.
+  To exercise the droplet, SSH in and run the equivalent curl against
+  `http://localhost:8420` from inside the box (matches how every other
+  droplet check in this project has been verified) rather than pointing
+  Bruno's `droplet` environment at it directly.
+
+**Requests:**
+
+| # | Request | Scenario |
+|---|---------|----------|
+| health/01 | Health Check | Liveness -- always 200 if the process is up |
+| health/02 | Readiness Check | Per-dependency check (OpenEMR, Anthropic, Langfuse); 503 if any are down |
+| chat/01 | Normal Orientation (pid1) | Grounded, multi-fact summary + duplicate-record warning |
+| chat/02 | Empty Chart (pid3) | True negative -- chart genuinely has nothing, must be reported honestly |
+| chat/03 | Malformed Patient ID | Graceful failure, no crash, still HTTP 200 |
+| chat/04 | Allergy Hard-Block (pid1) | Domain-constraint hard block on an uncoded/free-text allergy |
+| chat/05 | Adversarial Hallucination Bait (pid1) | Asks about a med the patient isn't on -- no fabricated dose/date reaches the user, whether by refusal or by the verification layer stripping it |
+| chat/06 | Duplicate Record Stale Signout (pid6) | Cross-checks a stale verbal sign-out against the live chart across a known duplicate record pair |
+| chat/07 | Ambiguous Query (pid1) | Underspecified question with no prior turn context -- known to have some run-to-run variance |
+
+`bru` (the Bruno CLI) was not installed in this environment, so these were
+verified by hand: every request's JSON body was run as an equivalent curl
+call against both the local instance and the droplet (via SSH), and each
+response was confirmed to match its documented expectation before this
+collection was committed.
+
 ## Known gaps (stated honestly, not fixed under time pressure)
 
 - **OAuth grant type.** `ARCHITECTURE.md` 1.3 calls for a `user/`-scoped
