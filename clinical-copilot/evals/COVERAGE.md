@@ -36,38 +36,103 @@ answers "did we break something we already know works," Behavioral Coverage
 answers "where does the agent's behavior actually get shaky across the
 long tail," and a small Golden Set alone can't answer the second question.
 
-**This is a named next step for Final Submission, not an oversight.**
-Building the 30-100 actual behavioral cases is out of scope for today --
-this section exists to document the distinction and commit to the plan, not
-to implement it. When it's built, the eval runner's terminal output (see
-below) already has a dedicated "Behavioral Coverage" section ready to report
-its results as a second, separately-interpreted number once real cases
-exist.
+**Status: built (2026-09-16).** `evals/behavioral_coverage.py` /
+`python3 -m evals.run_behavioral_coverage`, not gated, reported separately
+from the Golden Set per the design above.
+
+**Built by actually reading real traces, per the stated process**: derived
+from reading all 126 real conversation traces in `evals/trace_review_raw.md`
+(both local and droplet Langfuse instances, covering every real agent turn
+from today's work), naming what happened in plain language, then clustering
+into five categories -- not generated from a generic checklist. One of
+those five categories (terminology/abbreviation grounding) exists directly
+because reading real traces surfaced the COPD grounding issue documented in
+`ERROR_ANALYSIS.md` Entry 4.
+
+**Final count: 49 cases**, not a padded 50 -- Category 3 has 9, not 10
+(`c3_7`, testing confidence disclosure during a partial tool failure, was
+deliberately omitted rather than faked: a genuine partial failure, where
+some sub-resources succeed and one fails, isn't reliably reproducible with
+the current fixture data/tools, which currently either fully succeed or
+fully fail on a bad `patient_id`).
+
+| Category | Cases | Local | Droplet |
+|---|---|---|---|
+| 1. Terminology/abbreviation grounding | 10 | 9/10 | 9/10 |
+| 2. Pre-tool-call session integrity | 10 | 9/10 | 8/10 |
+| 3. Confidence/data-quality disclosure | 9 | 9/9 | 9/9 |
+| 4. Duplicate-record handling | 10 | 9/10 | 9/10 |
+| 5. Expanded existing categories | 10 | 10/10 | 10/10 |
+| **Total** | **49** | **46/49 (94%)** | **45/49 (92%)** |
+
+**Real findings from this run** (not gated, not build blockers -- this is
+exactly the information this suite exists to produce):
+
+- **A genuine, real gap confirmed by `c1_8_pcn_allergy_abbreviation`**:
+  asked about a "PCN allergy" in a general question (not proposing to give
+  a specific medication), the model correctly identified the allergy from
+  its own read of the chart but never called `check_allergy_conflict` --
+  reasonable given the system prompt's actual trigger condition ("before
+  you mention giving, starting, or continuing any medication"), which
+  wasn't met here. This may be the case's own expectation being too
+  strict rather than an agent defect; worth revisiting the case, not
+  necessarily the agent.
+- **`c2_3_cold_open_drug_safety`** revealed a real false-positive in
+  `verification.py` itself, not just in the case's check: the model
+  correctly declined to answer (no patient ID, "I won't speculate"), but
+  merely *repeating the resident's own drug name back* in a clarifying
+  question got treated as an ungrounded claim and partially stripped
+  (`flagged_claims: ['metformin']`). Same root cause already documented in
+  `verification.py`'s own module docstring (can't distinguish an assertion
+  from a non-assertion), now with a concrete reproduction.
+- **`c2_4_purely_conversational_first_turn`** passed locally but failed on
+  the droplet: identical code, identical message, different outcome (the
+  model proactively fetched and presented a full chart on the droplet run
+  when given only "Thanks, one more thing."). Genuine run-to-run model
+  variance on an ambiguous case, not an environment difference -- exactly
+  the kind of thing a single Golden Set run can't surface.
+- **`c4_8_repeat_warning_next_turn`** failed on both instances, by
+  design -- see the case's own `guards_against` text for the design
+  tension it's surfacing (per-turn independent enforcement vs. avoiding
+  repetition across a conversation).
+- **The most architecturally significant finding, found via the droplet
+  run of `c4_8`, confirmed deterministically afterward**:
+  `verify_response()`'s grounding only considers the *current turn's* own
+  tool calls, not the accumulated conversation history. In a multi-turn
+  conversation, if the model correctly answers a follow-up using data it
+  already fetched in an earlier turn (reasonable, efficient behavior -- no
+  need to re-fetch the same patient snapshot every turn), verification
+  incorrectly flags that true, previously-grounded fact as unverified,
+  purely because no *fresh* tool call happened this specific turn.
+  Reproduced with zero LLM cost: `verify_response("Reminder: this patient
+  has a documented penicillin allergy.", [], PID1, fhir)` (empty
+  `turn_records`, simulating a turn with no new tool call) yields
+  `flagged_claims: ['penicillin']` even though penicillin is genuinely in
+  pid1's real allergy record. This is a real correctness gap specific to
+  multi-turn conversations -- more significant than the other findings
+  here, since USERS.md explicitly treats natural follow-up questions as
+  core to this product's value, not an edge case. Not fixed today; flagged
+  as a priority item for before Final Submission.
+
+Full per-case detail: `evals/last_behavioral_run_results.json` (local) --
+regenerated on each run, not committed (matches the Golden Set's existing
+convention for `last_run_results.json`).
 
 ## Near-term next steps
 
-Both deferred deliberately (2026-09-16), not oversights -- noted here with
-enough specificity to pick back up without re-deriving the plan.
+**Highest priority: the multi-turn grounding gap** documented above
+(`verify_response()` only grounds against the current turn's own tool
+calls, not accumulated conversation history) -- a real correctness gap,
+not yet fixed.
 
-**Behavioral Coverage** (above): design and write 30-100 cases spanning a
-much wider range of phrasings and scenarios per USERS.md use case, run
-per-release rather than per-commit, evaluated for *patterns* of weakness
-rather than pass/fail correctness.
+**Behavioral Coverage set (above) is built, but not exhaustive.** 49 cases
+across 5 categories is a first pass derived from today's 126 real traces,
+not a ceiling -- expanding it as more real usage/traces accumulate remains
+worthwhile, following the same process (read real traces, name failure
+modes in plain language, then cluster), not by inventing more cases from a
+checklist.
 
-**Process for building this, not just the target size:** the right way to
-build this set is not to generate 30-100 cases from a generic checklist.
-It's to read real conversation traces one at a time, write down in plain
-language what went wrong (if anything) with no taxonomy in front of you,
-and only then cluster those notes into named failure-mode categories
-specific to this product. A downloaded or AI-generated taxonomy is useful
-for checking coverage after the fact, but useless as a starting point --
-this agent will fail in ways specific to clinical cross-coverage that no
-generic list would name. This process requires real usage data (or, before
-that exists, a deliberate red-teaming session using the same real-trace-
-reading discipline) -- it is not something to shortcut by having an LLM
-invent scenarios directly.
-
-**Langfuse Datasets/Experiments wiring:** register the Golden Set's 8 cases
+**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 8 cases
 as a persisted Langfuse Dataset (one item per case, keyed by case name for
 idempotent re-creation) so pass-rate history becomes a visible trend across
 runs in the Langfuse UI (Datasets/Experiments in the sidebar), not just a
