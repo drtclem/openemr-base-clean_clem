@@ -1,0 +1,44 @@
+name: Clinical Co-Pilot unit tests
+
+# Runs ONLY the fast, LLM-free unit test suite (evals/unit_tests.py) on every
+# push to main. The 8 LLM-based eval cases in evals/cases.py are NOT run
+# here -- they cost real Anthropic API spend per run, so they stay
+# manually-triggered (`python3 -m evals.run_evals`) before deploys, not on
+# every commit. See clinical-copilot/evals/COVERAGE.md's "two-tier testing
+# strategy" section.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "clinical-copilot/**"
+      - ".github/workflows/tests.yml"
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clinical-copilot
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run LLM-free unit tests
+        env:
+          OPENEMR_BASE_URL: ${{ secrets.OPENEMR_BASE_URL }}
+          OPENEMR_OAUTH_CLIENT_ID: ${{ secrets.OPENEMR_OAUTH_CLIENT_ID }}
+          OPENEMR_OAUTH_CLIENT_SECRET: ${{ secrets.OPENEMR_OAUTH_CLIENT_SECRET }}
+          OPENEMR_OAUTH_USERNAME: ${{ secrets.OPENEMR_OAUTH_USERNAME }}
+          OPENEMR_OAUTH_PASSWORD: ${{ secrets.OPENEMR_OAUTH_PASSWORD }}
+          OPENEMR_VERIFY_TLS: "false"
+          # Unused by unit_tests.py (no Anthropic calls in this suite) but
+          # required by app/config.py's Settings validation.
+          ANTHROPIC_API_KEY: "unused-in-unit-tests"
+        run: python3 -m evals.unit_tests

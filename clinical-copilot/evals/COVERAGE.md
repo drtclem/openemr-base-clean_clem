@@ -1,5 +1,27 @@
 # Eval suite coverage matrix
 
+## Two-tier testing strategy
+
+- **`evals/unit_tests.py`** -- fast, deterministic, zero Anthropic API calls
+  (real FHIR calls only). Runs automatically on every push to `main`
+  (`.github/workflows/tests.yml`). Regression safety net for the tools
+  (`get_patient_snapshot`, `check_allergy_conflict`) and `verification.py`'s
+  stripping logic, independent of whether the model behaves well on any
+  given day. Free and instant, so there's no reason not to run it constantly.
+- **`evals/cases.py`** (the 8 cases below) -- exercises the agent's actual
+  LLM behavior, real Anthropic calls, costs real spend per run. Triggered
+  manually / before deploys (`python3 -m evals.run_evals`), not on every
+  commit.
+
+This is a deliberate cost/coverage tradeoff, not an oversight: the unit
+suite catches regressions in the deterministic code paths for free on every
+commit; the LLM suite is the one that actually answers "does the agent
+behave correctly," which needs a real model call and therefore real cost, so
+it's reserved for the moments that matter (pre-deploy, after a prompt or
+verification change).
+
+## LLM-based eval case matrix
+
 Pulled directly from each `EvalCase.guards_against` field in `cases.py` -- this
 is a synthesis/formatting pass over what's already there, not new analysis.
 
