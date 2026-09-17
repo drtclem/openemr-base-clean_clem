@@ -189,5 +189,9 @@ collection was committed.
   damage, and the exposure is temporary, not a permanent posture. The
   fix -- a shared-secret header check in front of `/chat` -- is named as
   the next step once grading is done, not urgent tonight.
-- No OpenEMR module / chart UI entry point (`ARCHITECTURE.md` 1.1) -- `/chat`
-  is the only interface, also explicitly deferred.
+- No OpenEMR module / chart UI entry point (`ARCHITECTURE.md` 1.1) yet. A
+  minimal `GET /ui` chat page (plain HTML/CSS/JS, no build step, same
+  FastAPI app/port) now exists as a standalone grader convenience so
+  there's something to click instead of only curl -- see the top-level
+  README. It does not replace the real chart-embedded module, which
+  remains the actual planned next step per `ARCHITECTURE.md` 1.1.

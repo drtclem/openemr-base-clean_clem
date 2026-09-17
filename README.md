@@ -23,6 +23,10 @@ question — the response should catch the dose discrepancy and flag a duplicate
 See the Bruno collection (`clinical-copilot/bruno/`) for more example requests, including
 `/health` and `/ready`.
 
+Prefer clicking over curling? A minimal chat page is served at the same address:
+http://157.230.11.142:8420/ui — it defaults to the same fixture patient, so you can just type a
+message and go.
+
 ---
 
 ## What this is

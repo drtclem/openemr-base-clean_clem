@@ -22,7 +22,7 @@ from pathlib import Path
 import anthropic
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.agent import ClinicalCopilotAgent
@@ -170,6 +170,160 @@ def ready() -> JSONResponse:
     }
     all_ready = all(checks.values())
     return JSONResponse(status_code=200 if all_ready else 503, content={"ready": all_ready, "checks": checks})
+
+
+# pid1 (Alice Testpatient) -- a normal chart with a known duplicate record,
+# see evals/fixtures.py / bruno/chat/01. Same UUID on local and droplet
+# (both seeded from the same fixture data), so this default works
+# out of the box against either instance.
+_DEFAULT_PATIENT_ID = "98c4b82b-b07e-11f1-8334-022958ad0af8"
+
+_UI_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinical Co-Pilot</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 700px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+  }
+  h1 { font-size: 1.25rem; }
+  .patient-row { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 1rem; }
+  .patient-row label { font-size: 0.85rem; opacity: 0.75; white-space: nowrap; }
+  .patient-row input { flex: 1; }
+  input {
+    font: inherit;
+    padding: 0.5rem;
+    border: 1px solid #8888;
+    border-radius: 6px;
+  }
+  #thread {
+    border: 1px solid #8888;
+    border-radius: 8px;
+    height: 420px;
+    overflow-y: auto;
+    padding: 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+  .msg { margin-bottom: 1rem; }
+  .msg .who { font-weight: 600; font-size: 0.85rem; margin-bottom: 0.15rem; }
+  .msg .text { white-space: pre-wrap; }
+  .msg .meta { font-size: 0.75rem; opacity: 0.6; margin-top: 0.25rem; }
+  .msg.error .text { color: #c00; }
+  .send-row { display: flex; gap: 0.5rem; }
+  .send-row input { flex: 1; }
+  button {
+    font: inherit;
+    padding: 0.5rem 1rem;
+    border: none;
+    border-radius: 6px;
+    background: #2563eb;
+    color: white;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+  <h1>Clinical Co-Pilot</h1>
+  <div class="patient-row">
+    <label for="patientId">Patient ID</label>
+    <input id="patientId" value="__DEFAULT_PATIENT_ID__">
+  </div>
+  <div id="thread"></div>
+  <div class="send-row">
+    <input id="message" placeholder="Ask about this patient..." autocomplete="off">
+    <button id="send">Send</button>
+  </div>
+
+<script>
+let conversationId = null;
+const thread = document.getElementById("thread");
+const messageInput = document.getElementById("message");
+const patientIdInput = document.getElementById("patientId");
+const sendButton = document.getElementById("send");
+
+function appendMessage(who, text, meta, isError) {
+  const div = document.createElement("div");
+  div.className = "msg" + (isError ? " error" : "");
+  const whoDiv = document.createElement("div");
+  whoDiv.className = "who";
+  whoDiv.textContent = who;
+  const textDiv = document.createElement("div");
+  textDiv.className = "text";
+  textDiv.textContent = text;
+  div.appendChild(whoDiv);
+  div.appendChild(textDiv);
+  if (meta) {
+    const metaDiv = document.createElement("div");
+    metaDiv.className = "meta";
+    metaDiv.textContent = meta;
+    div.appendChild(metaDiv);
+  }
+  thread.appendChild(div);
+  thread.scrollTop = thread.scrollHeight;
+}
+
+async function sendMessage() {
+  const message = messageInput.value.trim();
+  if (!message) return;
+
+  appendMessage("You", message);
+  messageInput.value = "";
+  sendButton.disabled = true;
+
+  try {
+    const resp = await fetch("/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: message,
+        patient_id: patientIdInput.value.trim() || null,
+        conversation_id: conversationId,
+      }),
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      appendMessage("Error", `HTTP ${resp.status}: ${body}`, null, true);
+      return;
+    }
+    const data = await resp.json();
+    conversationId = data.conversation_id;
+    const flagged = data.flagged_claims && data.flagged_claims.length
+      ? data.flagged_claims.join(", ")
+      : "none";
+    const meta = `verification_passed: ${data.verification_passed} · flagged_claims: ${flagged}`;
+    appendMessage("Agent", data.response, meta);
+  } catch (err) {
+    appendMessage("Error", String(err), null, true);
+  } finally {
+    sendButton.disabled = false;
+    messageInput.focus();
+  }
+}
+
+sendButton.addEventListener("click", sendMessage);
+messageInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") sendMessage();
+});
+</script>
+</body>
+</html>
+""".replace("__DEFAULT_PATIENT_ID__", _DEFAULT_PATIENT_ID)
+
+
+@app.get("/ui", response_class=HTMLResponse)
+def ui() -> str:
+    """Minimal, self-contained chat page -- a grader convenience, not a
+    replacement for the real OpenEMR-embedded module (ARCHITECTURE.md
+    1.1), which remains future work. No build step, no new dependency:
+    plain HTML/CSS/JS served directly from this route."""
+    return _UI_HTML
 
 
 @app.post("/chat", response_model=ChatResponse)
