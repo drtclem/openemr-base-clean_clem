@@ -179,5 +179,15 @@ collection was committed.
   are not built yet, per the build prompt's explicit scope cut.
 - No `/health` / `/ready`, no Bruno collection, no load tests, no alerts --
   all explicitly deferred to Final Submission per the build prompt.
+- **`/chat` on the droplet (port 8420) has no authentication and is now
+  publicly reachable** -- required so graders can exercise it directly,
+  per the Bruno collection's `droplet` environment note above. The real
+  risk: anyone who finds the port can trigger real, cost-incurring
+  Anthropic API calls against it, not just read data. This is a
+  deliberate decision, not an oversight: accepted for the grading window
+  because the Anthropic account's own hard spend ceiling caps worst-case
+  damage, and the exposure is temporary, not a permanent posture. The
+  fix -- a shared-secret header check in front of `/chat` -- is named as
+  the next step once grading is done, not urgent tonight.
 - No OpenEMR module / chart UI entry point (`ARCHITECTURE.md` 1.1) -- `/chat`
   is the only interface, also explicitly deferred.
