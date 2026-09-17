@@ -24,8 +24,8 @@ See the Bruno collection (`clinical-copilot/bruno/`) for more example requests, 
 `/health` and `/ready`.
 
 Prefer clicking over curling? A minimal chat page is served at the same address:
-http://157.230.11.142:8420/ui — it defaults to the same fixture patient, so you can just type a
-message and go.
+http://157.230.11.142:8420/ui — it defaults to a different fixture patient (pid1, the original
+record rather than the duplicate used above), so you can just type a message and go.
 
 ---
 
