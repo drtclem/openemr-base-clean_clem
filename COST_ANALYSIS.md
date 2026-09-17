@@ -4,7 +4,7 @@
 
 | Item | Cost | Notes |
 |---|---|---|
-| DigitalOcean droplet (2 vCPU / 4GB, "Regular") | $24/month | Running since deployment; prorated actual spend so far is a fraction of this given the project's short runtime |
+| DigitalOcean droplet (4 vCPU / 8GB, "Basic") | $48/month (confirmed on DigitalOcean's current pricing page) | Resized up from 2 vCPU/4GB ($24/month) specifically to resolve the CPU-contention issue that was making Langfuse silently lose visibility into real request latency under load — see `evals/ERROR_ANALYSIS.md` Entry 6. Prorated actual spend so far is a fraction of this given the project's short runtime |
 | Claude Code (development assistant) | Flat subscription (Claude Pro/Max), not metered per-token | This is the cost of *building* the agent, separate from what the deployed agent itself will cost to *run* — see below |
 | GitHub + GitLab (labs.gauntletai.com) | $0 | Both used at their free tier |
 | Self-hosted Langfuse | $0 direct cost | Runs as a container on the already-paid-for droplet; no separate vendor spend |
@@ -16,8 +16,8 @@ full eval suite run twice (once locally, once against the deployed droplet). Not
 matches the per-interaction estimate below ($0.03/interaction) — roughly 10 interactions worth of
 usage, consistent with the number of eval cases and manual tests actually run.
 
-**Total known cost so far: ~$24/month (the droplet) + $0.32 (measured API usage) — genuinely
-minimal for a working, verified, deployed agent.**
+**Total known cost so far: ~$48/month (the droplet, after the resize) + $0.32 (measured API
+usage) — genuinely minimal for a working, verified, deployed agent.**
 
 ---
 
@@ -63,10 +63,17 @@ rotation some nights, not every night.
 ### 100 users
 **LLM cost:** 100 users × 5 interactions/day × $0.03 × 30 days ≈ **$450/month**
 
-**Architecture:** no changes needed. This is close to the current build's actual scale — a single
-DigitalOcean droplet running OpenEMR, the Co-Pilot service, and self-hosted Langfuse handles this
-comfortably. The audit's own performance testing already showed this droplet handling the full
-stack; this tier doesn't meaningfully stress it further.
+**Architecture:** no changes needed *for this specific usage assumption* — but that claim needs to
+be scoped precisely, not left as a blanket "comfortably handles it." "100 users" here means 100
+*registered* users at 5 interactions/day each, not 100 users hitting the service at once, and that
+distinction matters: real load testing (`clinical-copilot/PERFORMANCE_BASELINE.md`) found p95
+latency around 37 seconds at just **10 concurrent** users, even on the droplet after its resize to
+4 vCPU/8GB. At registered-user scale (5 interactions/day, spread across the day), the odds of 10+
+truly simultaneous requests are low, so the "no changes needed" conclusion for *this* tier's stated
+usage pattern still holds. But the FHIR/OpenEMR bottleneck this document already predicts for later
+tiers (see the 10,000-user tier below) is not only a future concern — it is already measurably
+present at small scale, confirmed directly by that load test, not projected. See
+`PERFORMANCE_BASELINE.md` for the actual numbers rather than restating them here.
 
 ### 1,000 users
 **LLM cost:** 1,000 users × 5 × $0.03 × 30 ≈ **$4,500/month**
