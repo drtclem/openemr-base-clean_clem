@@ -118,13 +118,16 @@ proving and what a correct response looks like.
 
 **Environments:**
 - `local` — talks straight to a `uvicorn` instance on the host.
-- `droplet` — points at the droplet's public IP. Note: the droplet's
-  `uvicorn` is bound to `127.0.0.1` only and port 8420 is not opened in
-  `ufw`, so this environment is not externally reachable as configured.
-  To exercise the droplet, SSH in and run the equivalent curl against
-  `http://localhost:8420` from inside the box (matches how every other
-  droplet check in this project has been verified) rather than pointing
-  Bruno's `droplet` environment at it directly.
+- `droplet` — points at the droplet's public IP. As of 2026-09-17, this is
+  genuinely externally reachable: `uvicorn` is bound to `0.0.0.0:8420` and
+  `ufw allow 8420/tcp` is in place, confirmed with a real curl from
+  outside the droplet (not just SSH-local), so Bruno's `droplet`
+  environment can be pointed at it directly, no SSH tunnel needed.
+  **Security note, worth knowing before using this:** `/chat` on that port
+  has no authentication at all -- anyone who finds the port can trigger
+  real Anthropic API calls (real cost) against it. Fine for a graded
+  submission's reachability requirement, but not something to leave open
+  indefinitely without at least considering an allowlist or rate limit.
 
 **Requests:**
 
