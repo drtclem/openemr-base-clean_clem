@@ -347,26 +347,40 @@ silently absent:
   `conversation_id` isn't bound to the authenticated session that created
   it, and `_conversations` (`app/main.py`) is a single unscoped
   process-wide dict. No eval case tests either.
-- **NEW, 2026-09-18: `get_recent_observations`'s live path is blocked on an
-  OAuth client scope registration, same class of gap as `get_recent_
-  encounters`' platform bug above but for a different reason.** Unlike
-  that bug (a genuine platform defect), this is a one-time local dev setup
-  step this build's OAuth client hasn't had applied yet: `user/
-  Observation.read` needs to be added to the registered client's `scope`
-  in `oauth_clients` (OpenEMR silently grants a narrower token than
-  requested rather than erroring when a client isn't registered for a
-  requested scope -- confirmed live, decoding a real issued token's JWT
-  payload: the `scopes` claim omitted `Observation.read` even though
-  `app/config.py`'s `oauth_scope` requested it). See `README.md`'s setup
-  section for the exact `UPDATE oauth_clients` command (mirrors the
-  existing `Encounter.read` retrofit instructions). Both new eval cases
+- **CLOSED 2026-09-18: `get_recent_observations`'s live path was blocked
+  on an OAuth client scope registration, same class of gap as
+  `get_recent_encounters`' platform bug above but for a different
+  reason.** Unlike that bug (a genuine platform defect), this was a
+  one-time local dev setup step this build's OAuth client hadn't had
+  applied yet: `user/Observation.read` needed to be added to the
+  registered client's `scope` in `oauth_clients` (OpenEMR silently grants
+  a narrower token than requested rather than erroring when a client
+  isn't registered for a requested scope -- confirmed live, decoding a
+  real issued token's JWT payload: the `scopes` claim omitted
+  `Observation.read` even though `app/config.py`'s `oauth_scope` requested
+  it). Fixed via the `UPDATE oauth_clients` command in `README.md`
+  (mirrors the existing `Encounter.read` retrofit). **Verified live,
+  end-to-end, same rigor as the encounter-sensitivity check**: decoded a
+  freshly issued token and confirmed `user/Observation.read` is now in its
+  `scopes` claim; a raw FHIR `Observation` search against pid1/pid2/pid3
+  returned HTTP 200 with zero results (not a 401) for all three; the real
+  `get_recent_observations()` tool call succeeded end-to-end
+  (`GetRecentObservationsOutput(..., observations=[], partial_failures=[])`,
+  no `ToolFailure`); and a full live agent turn ("What labs or vitals does
+  she have on file recently?", pid1) called the tool for real (non-zero
+  network latency, `failed: false`) and gave an honest, correctly-framed
+  empty-result response. **This dev fixture dataset genuinely has zero
+  Observation resources seeded for any test patient** -- confirmed across
+  pid1/pid2/pid3, not assumed -- so `observations_missing_honest_report`'s
+  scenario is representative of today's actual live behavior, not just a
+  stubbed hypothetical. Both new eval cases
   (`observations_missing_honest_report`, `observation_value_reaches_
-  response_accurately`) use a stubbed `FhirClient.search()` override for
-  the `Observation` resource type specifically, so they pass today
-  independent of this blocker -- they prove the tool's own parsing/
-  honesty logic is correct, not that the live end-to-end path works yet.
-  A live spot-check against the real API is still needed once the scope
-  is granted.
+  response_accurately`) still use a stubbed `FhirClient.search()` override
+  for the `Observation` resource type specifically for determinism (this
+  fixture set having no real seeded data to assert a specific value
+  against) -- they prove the tool's own parsing/honesty logic
+  deterministically; the live spot-check above independently confirms the
+  real end-to-end path also works now that the scope is granted.
 - **NEW, 2026-09-18: source-attribution has zero vocabulary coverage for
   lab/vitals terms.** `_ALL_TERMS` (`app/verification.py`) is built
   entirely from medication/allergy/condition names -- no lab or vital
