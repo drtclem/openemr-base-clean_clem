@@ -1,10 +1,13 @@
-"""The two Early Submission tools.
+"""The agent's tools.
 
-Both map directly to a USERS.md use case and a row of ARCHITECTURE.md's
+Each maps directly to a USERS.md use case and a row of ARCHITECTURE.md's
 Section 2 table:
 
-- get_patient_snapshot   -> Patient, Condition, AllergyIntolerance, MedicationRequest
-- check_allergy_conflict -> AllergyIntolerance vs. a supplied medication name
+- get_patient_snapshot    -> Patient, Condition, AllergyIntolerance, MedicationRequest
+- check_allergy_conflict  -> AllergyIntolerance vs. a supplied medication name
+- get_recent_encounters   -> Encounter (Phase 6, sensitivity-filtered -- app/sensitivity.py)
+- get_recent_observations -> Observation (UC2, NOT sensitivity-filtered -- see its own
+  docstring below for why that compensating control doesn't apply here)
 
 Error handling follows ARCHITECTURE.md Section 2's hard rule: a tool call
 that fails returns a structured ToolFailure the agent must surface directly,
@@ -28,7 +31,10 @@ from app.schemas import (
     GetPatientSnapshotOutput,
     GetRecentEncountersInput,
     GetRecentEncountersOutput,
+    GetRecentObservationsInput,
+    GetRecentObservationsOutput,
     MedicationFact,
+    ObservationFact,
     ToolFailure,
 )
 from app.sensitivity import Role, filter_encounters_by_sensitivity
@@ -361,3 +367,74 @@ def get_recent_encounters(fhir: FhirClient, raw_input: dict) -> GetRecentEncount
         sensitivity_filtered_count=len(fhir_encounters) - len(encounters),
         partial_failures=partial_failures,
     )
+
+
+def _observation_value_text(res: dict) -> str | None:
+    """Extracts a human-readable value from a FHIR Observation's
+    polymorphic `value[x]` -- quantity (with unit), string, CodeableConcept,
+    or (for panel-style observations like blood pressure) a `component`
+    array of sub-measurements, each with its own code + value. None if no
+    value is present at all (e.g. a pending/cancelled result) -- callers
+    must not treat that as "value 0" or synthesize a placeholder; an
+    ObservationFact with value=None and a real status is the honest
+    representation of that case."""
+    quantity = res.get("valueQuantity")
+    if quantity and quantity.get("value") is not None:
+        unit = quantity.get("unit") or quantity.get("code") or ""
+        return f"{quantity['value']} {unit}".strip()
+    if res.get("valueString"):
+        return res["valueString"]
+    concept_text, is_coded = _codeable_concept_text(res.get("valueCodeableConcept"))
+    if is_coded:
+        return concept_text
+    components = res.get("component") or []
+    parts: list[str] = []
+    for comp in components:
+        comp_text, _ = _codeable_concept_text(comp.get("code"))
+        comp_quantity = comp.get("valueQuantity")
+        if comp_quantity and comp_quantity.get("value") is not None:
+            unit = comp_quantity.get("unit") or comp_quantity.get("code") or ""
+            parts.append(f"{comp_text}: {comp_quantity['value']} {unit}".strip())
+    return ", ".join(parts) if parts else None
+
+
+def get_recent_observations(fhir: FhirClient, raw_input: dict) -> GetRecentObservationsOutput | ToolFailure:
+    """UC2 (USERS.md): "what changed" for labs/vitals -- the same sign-out-
+    verification role get_recent_encounters plays for visit history.
+    Deliberately NOT run through app/sensitivity.py's compensating filter;
+    see GetRecentObservationsOutput's docstring in schemas.py for why that
+    control (scoped specifically to Encounter data) doesn't apply here.
+    """
+    try:
+        params = GetRecentObservationsInput.model_validate(raw_input)
+    except Exception:
+        return ToolFailure(
+            tool="get_recent_observations",
+            reason="I couldn't process that patient reference -- it wasn't a valid patient ID.",
+            detail_code="invalid_input",
+        )
+
+    try:
+        bundle = fhir.search("Observation", {"patient": params.patient_id})
+    except FhirRequestError as exc:
+        return ToolFailure(
+            tool="get_recent_observations",
+            reason=f"I couldn't retrieve this patient's recent labs/vitals ({exc.detail_code}).",
+            detail_code=exc.detail_code,  # type: ignore[arg-type]
+        )
+
+    observations: list[ObservationFact] = []
+    for res in bundle_entries(bundle):
+        text, _ = _codeable_concept_text(res.get("code"))
+        observations.append(
+            ObservationFact(
+                text=text,
+                value=_observation_value_text(res),
+                status=res.get("status"),
+                effective_datetime=res.get("effectiveDateTime")
+                or (res.get("effectivePeriod") or {}).get("start"),
+                source_resource=f"Observation/{res.get('id')}",
+            )
+        )
+
+    return GetRecentObservationsOutput(patient_id=params.patient_id, observations=observations)

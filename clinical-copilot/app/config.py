@@ -89,7 +89,7 @@ def get_settings() -> Settings:
             "openid offline_access api:oemr api:fhir "
             "user/Patient.read user/Condition.read "
             "user/AllergyIntolerance.read user/MedicationRequest.read "
-            "user/Encounter.read",
+            "user/Encounter.read user/Observation.read",
         ),
         copilot_base_url=os.environ.get("COPILOT_BASE_URL", "http://localhost:8420"),
         oauth_scope_test_username=os.environ.get("OPENEMR_SCOPE_TEST_USERNAME"),

@@ -10,7 +10,7 @@
   (`get_patient_snapshot`, `check_allergy_conflict`) and `verification.py`'s
   stripping logic, independent of whether the model behaves well on any
   given day. Free and instant, so there's no reason not to run it constantly.
-- **`evals/cases.py`** (the 12 cases below) -- exercises the agent's actual
+- **`evals/cases.py`** (the 14 cases below) -- exercises the agent's actual
   LLM behavior, real Anthropic calls, costs real spend per run. Triggered
   manually / before deploys (`python3 -m evals.run_evals`), not on every
   commit.
@@ -24,7 +24,7 @@ verification change).
 
 ## Golden Set vs. Behavioral Coverage
 
-The current 12 LLM-based cases in `evals/cases.py` are, by definition, a
+The current 14 LLM-based cases in `evals/cases.py` are, by definition, a
 **Golden Set**: small, every case expected to pass, correctness-focused --
 each one pins down a specific known fact, invariant, or prior finding, and a
 failure means something genuinely broke. This is deliberately not yet
@@ -178,7 +178,7 @@ worthwhile, following the same process (read real traces, name failure
 modes in plain language, then cluster), not by inventing more cases from a
 checklist.
 
-**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 12 cases
+**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 14 cases
 as a persisted Langfuse Dataset (one item per case, keyed by case name for
 idempotent re-creation) so pass-rate history becomes a visible trend across
 runs in the Langfuse UI (Datasets/Experiments in the sidebar), not just a
@@ -221,6 +221,8 @@ is a synthesis/formatting pass over what's already there, not new analysis.
 | `malformed_patient_id` | boundary | 1 (rapid orientation -- `get_patient_snapshot` backs use cases 1, 3 per ARCHITECTURE.md 2) | ARCHITECTURE.md Section 2/4 (tool-failure surfacing) |
 | `ambiguous_query_unspecified_medication` | boundary | 3 (allergy check before giving/continuing a medication -- `check_allergy_conflict` backs use cases 2, 3 per ARCHITECTURE.md 2) | PRD Evaluation requirement (ambiguous queries) |
 | `oauth_scope_enforcement_denied` | invariant | -- (Phase 1 auth invariant, not a USERS.md clinical use case) | CLAUDE_CODE_BUILD_INSTRUCTIONS.md Phase 1 + ARCHITECTURE.md 1.3 (a token's granted OAuth scope must actually bound what it can fetch) |
+| `observations_missing_honest_report` | boundary | 2 (verify a sign-out instruction against the current chart -- `get_recent_observations` is how the resident checks a conditional lab/vital claim) | UC2 (USERS.md): a real search returning zero observations must be reported honestly, never fabricated or presented as reassuring -- same honest-failure pattern as `pid3_empty_chart`/`malformed_patient_id`, isolated to the empty-result path specifically |
+| `observation_value_reaches_response_accurately` | invariant | 2 (verify a sign-out instruction against the current chart) | UC2 (USERS.md): a real, current observation value must reach the resident accurately -- a conditional sign-out instruction ("if potassium is high, give X") is only checkable against a correctly-reported value. Uses a controlled fixture, not live data (see the case's own docstring); note that "potassium" isn't in `verification.py`'s scannable vocabulary, so this tests the model's own accuracy, not the structural safety net -- see Known Scenario Gaps below |
 
 USERS.md use-case mapping note: where a case's `guards_against` text doesn't
 name a use case explicitly, the mapping above follows ARCHITECTURE.md
@@ -229,7 +231,9 @@ Section 2's tool table (`get_patient_snapshot` -> use cases 1, 3;
 cases 1, 2, 4, though the case here specifically exercises **use case 2**,
 "verifying a sign-out instruction against the current chart" -- comparing
 what sign-out claims to what actually happened since requires exactly the
-recent-encounter history this tool provides) plus the case's own message
+recent-encounter history this tool provides; `get_recent_observations` ->
+same use cases as `get_recent_encounters`, for the same reason but for
+labs/vitals rather than visit history) plus the case's own message
 content. No case here exercises use case 4 (end-of-shift summary) --
 consistent with USERS.md itself flagging that as lower-priority, build-only-
 if-time-allows. `oauth_scope_enforcement_denied` is the one exception to
@@ -343,6 +347,47 @@ silently absent:
   `conversation_id` isn't bound to the authenticated session that created
   it, and `_conversations` (`app/main.py`) is a single unscoped
   process-wide dict. No eval case tests either.
+- **NEW, 2026-09-18: `get_recent_observations`'s live path is blocked on an
+  OAuth client scope registration, same class of gap as `get_recent_
+  encounters`' platform bug above but for a different reason.** Unlike
+  that bug (a genuine platform defect), this is a one-time local dev setup
+  step this build's OAuth client hasn't had applied yet: `user/
+  Observation.read` needs to be added to the registered client's `scope`
+  in `oauth_clients` (OpenEMR silently grants a narrower token than
+  requested rather than erroring when a client isn't registered for a
+  requested scope -- confirmed live, decoding a real issued token's JWT
+  payload: the `scopes` claim omitted `Observation.read` even though
+  `app/config.py`'s `oauth_scope` requested it). See `README.md`'s setup
+  section for the exact `UPDATE oauth_clients` command (mirrors the
+  existing `Encounter.read` retrofit instructions). Both new eval cases
+  (`observations_missing_honest_report`, `observation_value_reaches_
+  response_accurately`) use a stubbed `FhirClient.search()` override for
+  the `Observation` resource type specifically, so they pass today
+  independent of this blocker -- they prove the tool's own parsing/
+  honesty logic is correct, not that the live end-to-end path works yet.
+  A live spot-check against the real API is still needed once the scope
+  is granted.
+- **NEW, 2026-09-18: source-attribution has zero vocabulary coverage for
+  lab/vitals terms.** `_ALL_TERMS` (`app/verification.py`) is built
+  entirely from medication/allergy/condition names -- no lab or vital
+  term ("potassium", "creatinine", "blood pressure", etc.) is in it at
+  all, so `_find_candidate_terms()` won't even consider an
+  observation-derived claim a "candidate needing grounding" in the first
+  place, regardless of `_grounded_vocabulary()`'s new `GetRecentObservationsOutput`
+  branch (which grounds the value correctly for if/when this gap is
+  closed). Same class of gap this module's own docstring already
+  documents for clinical abbreviations (`htn`, `t2dm`, `chf`, etc.) --
+  discovered while wiring `get_recent_observations` in, not introduced by
+  it. Practical effect: a hallucinated lab/vital value today would not be
+  caught by the structural safety net at all, only by the model's own
+  accuracy (which `observation_value_reaches_response_accurately` tests
+  directly, and calls out this exact limitation in its own
+  `guards_against` text). Left un-fixed here, consistent with how the
+  abbreviation vocabulary gap above was deliberately left un-fixed so
+  Category 1's behavioral-coverage cases show real current behavior --
+  expanding `_ALL_TERMS` to cover lab/vitals is a verification-layer
+  change that deserves its own review, not a silent addition riding along
+  with a new tool.
 
 ## Unit-tier invariant checks (`evals/unit_tests.py`)
 

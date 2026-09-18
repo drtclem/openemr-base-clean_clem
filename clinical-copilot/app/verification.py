@@ -34,7 +34,12 @@ import re
 from dataclasses import dataclass, field
 
 from app.fhir_client import FhirClient
-from app.schemas import CheckAllergyConflictOutput, GetPatientSnapshotOutput, GetRecentEncountersOutput
+from app.schemas import (
+    CheckAllergyConflictOutput,
+    GetPatientSnapshotOutput,
+    GetRecentEncountersOutput,
+    GetRecentObservationsOutput,
+)
 from app.tools import check_allergy_conflict
 
 # Curated clinical-term vocabulary used ONLY to decide "this looks like a
@@ -137,6 +142,24 @@ def _grounded_vocabulary(records: list[ToolCallRecord]) -> set[str]:
             # tool isn't falsely flagged as unverified.
             for enc in rec.output.encounters:
                 vocab.add(enc.text.lower())
+        elif isinstance(rec.output, GetRecentObservationsOutput):
+            # UC2: grounds an observation's measured-thing text (e.g.
+            # "potassium") and its formatted value (e.g. "5.2 mEq/L") so a
+            # real, sourced fact from this tool isn't falsely flagged.
+            # NOTE, discovered while wiring this in: _ALL_TERMS below has
+            # no lab/vitals vocabulary at all, so _find_candidate_terms()
+            # won't treat a lab/vital claim as a "candidate needing
+            # grounding" in the first place regardless of this branch --
+            # same class of scannable-vocabulary gap this module's own
+            # docstring already documents for clinical abbreviations. This
+            # branch grounds the value for if/when that gap is closed; the
+            # gap itself is a separate, pre-existing limitation of
+            # source-attribution's coverage, not something introduced or
+            # closed by this tool addition.
+            for obs in rec.output.observations:
+                vocab.add(obs.text.lower())
+                if obs.value:
+                    vocab.add(obs.value.lower())
     return vocab
 
 

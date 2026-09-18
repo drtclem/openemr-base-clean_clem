@@ -1,4 +1,4 @@
-"""Pydantic schemas for the two tools, per ARCHITECTURE.md 7.3: these are the
+"""Pydantic schemas for each tool, per ARCHITECTURE.md 7.3: these are the
 source of truth for each tool's input/output shape. A tool implementation that
 can't populate one of these validly must raise, not return malformed data --
 see tools.py.
@@ -120,6 +120,38 @@ class GetRecentEncountersOutput(BaseModel):
             "call happened to exclude anything."
         ),
     )
+    partial_failures: list[str] = Field(default_factory=list)
+
+
+# --- get_recent_observations (UC2, USERS.md) --------------------------------
+#
+# Deliberately NOT run through app/sensitivity.py's compensating filter, per
+# explicit build instruction: that filter is specifically for Encounter-type
+# data (ARCHITECTURE.md 3.3's own scope is the FHIR Encounter resource, which
+# has no sensitivity field at all). Observation carries a different risk
+# profile -- it's not the resource type that compensating control exists for
+# -- so this tool is not gated behind it. If a future finding shows
+# Observation data needs its own compensating control, that's a new,
+# separate gap to evaluate on its own terms, not an oversight here.
+
+
+class GetRecentObservationsInput(BaseModel):
+    patient_id: str = Field(..., description="OpenEMR FHIR Patient resource id (UUID).")
+
+
+class ObservationFact(BaseModel):
+    text: str  # what was measured, e.g. "Blood Pressure", "Potassium"
+    value: str | None = Field(
+        None, description="Formatted value + unit if present, e.g. '5.2 mEq/L' or '120/80 mmHg'."
+    )
+    status: str | None
+    effective_datetime: str | None
+    source_resource: str  # e.g. "Observation/<fhir-id>"
+
+
+class GetRecentObservationsOutput(BaseModel):
+    patient_id: str
+    observations: list[ObservationFact]
     partial_failures: list[str] = Field(default_factory=list)
 
 

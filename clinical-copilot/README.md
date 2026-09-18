@@ -39,17 +39,27 @@ Save the returned `client_id` / `client_secret` into `.env`. Then, from
 type (both disabled by default -- see `architecture-audit.md` 6.1 and
 "Known gaps" below), point its `redirect_uri` at this app's real `/callback`
 (the registration above used a placeholder), and add `user/Encounter.read`
-to its allowed `scope` (needed for the Phase 1 sensitivity-filter work, see
-ARCHITECTURE.md 3.3 -- the FHIR API omits this resource's sensitivity field
-entirely, and OpenEMR won't grant a scope a client isn't registered for
+and `user/Observation.read` to its allowed `scope` (needed for the Phase 1
+sensitivity-filter work and UC2's get_recent_observations respectively --
+see ARCHITECTURE.md 3.3, the FHIR API omits Encounter's sensitivity field
+entirely; and OpenEMR won't grant a scope a client isn't registered for
 regardless of what the consent screen shows):
 
 ```bash
 docker compose exec openemr mysql -h mysql -uroot -proot -D openemr -e \
   "UPDATE oauth_clients SET is_enabled=1, grant_types='authorization_code|password|refresh_token', \
    redirect_uri=CONCAT(redirect_uri, '|http://localhost:8420/callback'), \
-   scope=CONCAT(scope, ' user/Encounter.read') \
+   scope=CONCAT(scope, ' user/Encounter.read user/Observation.read') \
    WHERE client_id='<your client_id>';"
+```
+
+Retrofitting an existing client that's missing just `user/Observation.read`
+(e.g. it already has `Encounter.read` from an earlier setup):
+
+```bash
+docker compose exec openemr mysql -h mysql -uroot -proot -D openemr -e \
+  "UPDATE oauth_clients SET scope=CONCAT(scope, ' user/Observation.read') \
+   WHERE client_id='<your client_id>' AND scope NOT LIKE '%user/Observation.read%';"
 ```
 
 Password grant stays enabled for one reason: the automated eval suite
