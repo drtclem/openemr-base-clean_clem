@@ -88,4 +88,6 @@ class CheckAllergyConflictOutput(BaseModel):
 class ToolFailure(BaseModel):
     tool: str
     reason: str = Field(..., description="Safe to show a resident directly, no raw exception text.")
-    detail_code: Literal["timeout", "http_error", "not_found", "malformed_response", "invalid_input"]
+    detail_code: Literal[
+        "timeout", "http_error", "not_found", "malformed_response", "invalid_input", "patient_mismatch"
+    ]

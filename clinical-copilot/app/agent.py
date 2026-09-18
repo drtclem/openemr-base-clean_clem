@@ -107,9 +107,18 @@ class ChatTurnResult:
 
 
 class ClinicalCopilotAgent:
-    def __init__(self, settings: Settings, fhir: FhirClient, observer: TurnObserver | None = None):
+    def __init__(
+        self, settings: Settings, default_fhir: FhirClient | None = None, observer: TurnObserver | None = None
+    ):
+        """default_fhir: used only when a run_turn() call omits its own
+        `fhir` -- the eval harness's 7 golden-set cases share one fixed
+        FhirClient this way (evals/run_evals.py). The live /chat path
+        (app/main.py) never relies on this: it resolves a resident-scoped
+        FhirClient per request and always passes it explicitly, per
+        Phase 1 (CLAUDE_CODE_BUILD_INSTRUCTIONS.md) -- there is no single
+        identity this agent could default to for live traffic."""
         self._settings = settings
-        self._fhir = fhir
+        self._default_fhir = default_fhir
         self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         self._observer = observer or TurnObserver(settings)
 
@@ -119,6 +128,7 @@ class ClinicalCopilotAgent:
         user_message: str,
         patient_id: str | None,
         prior_tool_records: list[ToolCallRecord] | None = None,
+        fhir: FhirClient | None = None,
     ) -> ChatTurnResult:
         """prior_tool_records: every real tool result fetched in EARLIER turns
         of this same conversation (pass back the previous ChatTurnResult's
@@ -127,7 +137,14 @@ class ClinicalCopilotAgent:
         follow-up question the model correctly answers from an earlier
         fetch, without redundantly re-calling the tool, gets its true,
         already-grounded claim wrongly flagged as unverified. See
-        ERROR_ANALYSIS.md Entry 5."""
+        ERROR_ANALYSIS.md Entry 5.
+
+        fhir: which resident's (or eval fixture's) scope this turn's FHIR
+        calls run under. Falls back to `default_fhir` from the constructor
+        if omitted -- see __init__'s docstring for who relies on that."""
+        fhir = fhir or self._default_fhir
+        if fhir is None:
+            raise ValueError("run_turn() needs a fhir client: pass one explicitly or set default_fhir.")
         correlation_id = str(uuid.uuid4())
         trace = self._observer.start_turn(correlation_id, user_message, patient_id)
 
@@ -174,7 +191,7 @@ class ClinicalCopilotAgent:
             tool_results_content = []
             for block in tool_use_blocks:
                 tool_handle = trace.start_tool_call(tool_name=block.name, input_payload=block.input)
-                output = self._call_tool(block.name, block.input)
+                output = self._call_tool(block.name, block.input, fhir, patient_id)
                 is_failure = isinstance(output, ToolFailure)
                 trace.finish_tool_call(tool_handle, output_payload=_to_jsonable(output), failed=is_failure)
                 latency = time.monotonic() - tool_handle.wall_t0
@@ -216,7 +233,7 @@ class ClinicalCopilotAgent:
         # the current patient (accumulated_tool_records below still keeps the
         # full history, in case the conversation switches back later).
         records_for_active_patient = [r for r in turn_records if r.patient_id == patient_id]
-        outcome = verify_response(draft_text, records_for_active_patient, patient_id, self._fhir)
+        outcome = verify_response(draft_text, records_for_active_patient, patient_id, fhir)
         trace.log_verification(
             passed_source_attribution=outcome.passed_source_attribution,
             passed_domain_constraint=outcome.passed_domain_constraint,
@@ -239,11 +256,34 @@ class ClinicalCopilotAgent:
             accumulated_tool_records=turn_records,
         )
 
-    def _call_tool(self, name: str, tool_input: dict):
+    def _call_tool(self, name: str, tool_input: dict, fhir: FhirClient, active_patient_id: str | None):
+        """active_patient_id: this turn's declared active patient (run_turn's
+        own `patient_id` argument). Checked against the tool call's own
+        `patient_id` argument BEFORE dispatch -- a mismatch is rejected here,
+        never reaching the real FHIR read. Previously this cross-check only
+        happened after the fact, filtering which already-fetched records
+        counted toward grounding (records_for_active_patient in run_turn);
+        the read itself ran unconditionally for whatever patient_id the
+        model's tool call carried, real PHI for an unrelated patient
+        included. A prompt instruction telling the model which patient is
+        active is not a substitute for this -- ARCHITECTURE.md 3.2's "a wall,
+        not a request" principle applies here exactly as it does to the
+        allergy-conflict check."""
+        requested_patient_id = tool_input.get("patient_id")
+        if active_patient_id and requested_patient_id and requested_patient_id != active_patient_id:
+            return ToolFailure(
+                tool=name,
+                reason=(
+                    f"Blocked: this tool call requested patient_id={requested_patient_id!r}, which "
+                    f"does not match this conversation's active patient ({active_patient_id!r}). A "
+                    "tool call may only read the patient currently being discussed."
+                ),
+                detail_code="patient_mismatch",
+            )
         impl = _TOOL_IMPLS.get(name)
         if impl is None:
             return ToolFailure(tool=name, reason=f"Unknown tool '{name}'.", detail_code="invalid_input")
-        return impl(self._fhir, tool_input)
+        return impl(fhir, tool_input)
 
 
 def _to_jsonable(output) -> dict:

@@ -240,6 +240,31 @@ def _enforce_duplicate_and_empty_chart(
     return response, enforced
 
 
+def _effective_domain_check_patient_id(
+    current_patient_id: str | None, turn_records: list[ToolCallRecord]
+) -> str | None:
+    """The patient the hard-coded allergy-conflict backstop should run
+    against. Prefers the caller-declared active patient; if the caller
+    omitted it, falls back to whichever single patient this turn's own tool
+    calls actually grounded data for -- an omitted request field is not a
+    reason to skip a code-level safety check (ARCHITECTURE.md 3.2's "a wall,
+    not a request"). Concretely: `patient_id: null` on /chat previously
+    disabled this check entirely (passed_domain_constraint stayed True with
+    no [HARD STOP] even for a real, documented conflict) purely because
+    `if current_patient_id:` was falsy -- confirmed live against pid1's real
+    penicillin allergy. Returns None only when genuinely ambiguous (more than
+    one distinct patient touched this turn), matching this system's already-
+    documented single-active-patient-per-turn assumption (README.md Known
+    Gaps) rather than guessing which one to check.
+    """
+    if current_patient_id:
+        return current_patient_id
+    record_patient_ids = {r.patient_id for r in turn_records if r.patient_id}
+    if len(record_patient_ids) == 1:
+        return next(iter(record_patient_ids))
+    return None
+
+
 def verify_response(
     draft_response: str,
     turn_records: list[ToolCallRecord],
@@ -251,9 +276,10 @@ def verify_response(
 
     domain_enforced: list[str] = []
     passed_domain = True
-    if current_patient_id:
+    effective_patient_id = _effective_domain_check_patient_id(current_patient_id, turn_records)
+    if effective_patient_id:
         after_source_check, domain_enforced, passed_domain = _check_domain_constraint(
-            after_source_check, turn_records, current_patient_id, fhir
+            after_source_check, turn_records, effective_patient_id, fhir
         )
 
     final_response, structural_enforced = _enforce_duplicate_and_empty_chart(
