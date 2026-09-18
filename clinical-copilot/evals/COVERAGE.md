@@ -490,12 +490,24 @@ silently absent:
   shape to match on and has no cheap structural fix** -- explicitly not
   attempted here; the accepted approach for that half remains incrementally
   expanding `_ALL_TERMS`, per that module's own existing comment. Caught
-  and fixed live during this build: the new regex's own candidate
-  detection initially broke grounding for a real, tool-sourced value
-  ("38.9°C" from the model vs. "38.9 C" as stored) purely on cosmetic
-  formatting (spacing, the degree symbol) -- `_is_grounded()` now
-  normalizes both sides before giving up, rather than stripping a true
-  fact over formatting.
+  and fixed live during this build, then a second time on the very next
+  full-suite run after the first fix landed -- both now permanent unit
+  tests (`test_lab_value_grounding_tolerates_formatting`,
+  `test_lab_value_range_mention_not_flagged`, `evals/unit_tests.py`), not
+  left as one-off interactive checks that happened to work once: (1) the
+  new regex's own candidate detection initially broke grounding for a
+  real, tool-sourced value ("38.9°C" from the model vs. "38.9 C" as
+  stored) purely on cosmetic formatting (spacing, the degree symbol) --
+  `_is_grounded()` now normalizes both sides before giving up, rather than
+  stripping a true fact over formatting; (2) it also caught the upper
+  bound of a stated reference range ("normal range (~3.5-5.0 mEq/L)") and
+  stripped it as an unverified claim, even though a reference range is
+  general medical knowledge, not a claim about the patient -- this one a
+  real production regression in `verification.py` itself, not just an
+  eval-case check, found because a full regression pass was re-run rather
+  than trusted from the first green result. Fixed with
+  `_LAB_VALUE_RANGE_PREFIX_RE`, excluding a value that's the second half
+  of an "X-Y unit" range from candidacy.
 
   **A new, distinct injection-channel finding, not folded into this
   build's own code changes: `THREAT_MODEL.md` 4.8.** Investigated first,
@@ -550,3 +562,5 @@ in test-runner output:
 | `test_check_allergy_conflict_cross_reactive` | invariant | `check_allergy_conflict` must flag amoxicillin against pid1's documented penicillin allergy via the curated drug-class table (`app/clinical_reference.py`, Phase 5), not only a direct/substring name match. |
 | `test_check_allergy_conflict_cross_reactive_scoped_to_curated_classes` | invariant | The cross-reactivity table must not over-fire outside its curated scope -- a medication in no curated class and not a direct match (metformin) must still report no conflict. |
 | `test_shift_summary_reports_nothing_gathered_yet` | boundary | UC4's other honest-failure condition (companion to `shift_summary_empty_honest_report` in `evals/cases.py`): `summarize_shift_events` must report `data_gathered=False`, scoped per-patient, when nothing has been fetched for this patient yet this conversation -- a Python-level contract, tested here rather than via an LLM message since a compliant model should rarely hit this path naturally. |
+| `test_lab_value_grounding_tolerates_formatting` | regression | Added after a live bug during `compare_signout_to_chart`'s build: `_LAB_VALUE_RE`'s candidate detection extracted a real temperature value the model wrote as "38.9°C", but grounding stored it as "38.9 C" -- an exact-substring mismatch stripped a true, tool-sourced fact. At the time this was only verified with a one-off interactive check, not a permanent test; this closes that gap. Confirms both the equivalence (real value survives despite formatting) and the control (a genuinely different value is still caught, not swept in by the same normalization). |
+| `test_lab_value_range_mention_not_flagged` | regression | Second live bug, found on the very next full-suite run after the fix above landed: `_LAB_VALUE_RE` also caught the upper bound of a stated reference range ("normal range (~3.5-5.0 mEq/L)") and stripped it as an unverified claim, even though a reference range is general medical knowledge, not a claim about the patient -- this one was a real production regression in `verification.py`, not just an eval-case check. Fixed with `_LAB_VALUE_RANGE_PREFIX_RE`, which excludes a value that's the second half of an "X-Y unit" range from candidacy. Confirms the reference-range mention survives untouched, and the control that a genuinely fabricated value elsewhere in the same response is still caught. |

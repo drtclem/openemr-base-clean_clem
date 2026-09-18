@@ -28,6 +28,8 @@ from app.fhir_client import FhirClient
 from app.schemas import (
     CheckAllergyConflictOutput,
     GetPatientSnapshotOutput,
+    GetRecentObservationsOutput,
+    ObservationFact,
     SummarizeShiftEventsOutput,
     ToolFailure,
 )
@@ -169,6 +171,119 @@ def test_verification_passes_grounded_claim(fhir: FhirClient) -> tuple[bool, str
     if grounded_draft not in outcome.final_response:
         return False, "the grounded draft text should pass through unmodified (verification notes may be appended)"
     return True, "an all-grounded draft passed through untouched"
+
+
+def test_lab_value_grounding_tolerates_formatting(fhir: FhirClient) -> tuple[bool, str]:
+    """Regression test for a bug caught and fixed live during compare_
+    signout_to_chart's build (2026-09-18) -- at the time it was only
+    verified with a one-off interactive check, not a permanent test; this
+    is that missing test. _LAB_VALUE_RE (app/verification.py) extracts a
+    lab/vital value from the model's own drafted prose, but the model
+    doesn't always format it identically to how
+    ObservationFact.value/_observation_value_text() (app/tools.py) stored
+    it -- e.g. the model writing "38.9°C" (the real degree symbol, no
+    space) against a stored "38.9 C" (a space, no degree symbol). Without
+    _is_grounded()'s normalization fallback, this exact mismatch strips a
+    true, tool-sourced value from the response.
+
+    Confirms both directions that matter: the equivalent-but-differently-
+    formatted value IS treated as grounded (the bug that was actually
+    found), and -- the control that proves this isn't just loosened
+    grounding in general -- a genuinely different value is NOT swept in as
+    a false match by the same normalization.
+    """
+    observations = GetRecentObservationsOutput(
+        patient_id=f.PID1_ALICE,
+        observations=[
+            ObservationFact(
+                text="Temperature",
+                value="38.9 C",
+                status="final",
+                effective_datetime="2026-09-18T01:00:00Z",
+                source_resource="Observation/fixture-temp-1",
+            )
+        ],
+    )
+    record = ToolCallRecord(tool_name="get_recent_observations", patient_id=f.PID1_ALICE, output=observations)
+
+    matching_draft = "Her most recent temperature was 38.9°C, which is febrile."
+    outcome = verify_response(matching_draft, [record], f.PID1_ALICE, fhir)
+    if any("38.9" in c for c in outcome.flagged_claims):
+        return False, (
+            "the real temperature (38.9 C, as stored) was incorrectly stripped when the model "
+            f"wrote it as 38.9°C -- got flagged_claims={outcome.flagged_claims}"
+        )
+    if "38.9" not in outcome.final_response:
+        return False, "the real, matching temperature value did not survive into the final response"
+
+    wrong_draft = "Her most recent temperature was 39.5°C, which is febrile."
+    wrong_outcome = verify_response(wrong_draft, [record], f.PID1_ALICE, fhir)
+    if not any("39.5" in c for c in wrong_outcome.flagged_claims):
+        return False, (
+            "control failed: a genuinely different temperature (39.5°C, not in the tool "
+            f"output) should still be flagged as ungrounded, got flagged_claims={wrong_outcome.flagged_claims}"
+        )
+
+    return True, (
+        "a real lab value survives despite cosmetic formatting differences, and a genuinely "
+        "different value is still caught"
+    )
+
+
+def test_lab_value_range_mention_not_flagged(fhir: FhirClient) -> tuple[bool, str]:
+    """Regression test for a second live bug, found on the very next
+    full-suite run after test_lab_value_grounding_tolerates_formatting's
+    fix landed (2026-09-18): _LAB_VALUE_RE's candidate detection also
+    caught the upper bound of a stated reference range ("...above the
+    typical normal range (~3.5-5.0 mEq/L)") and stripped it as an
+    "unverified claim" -- even though a reference range is general medical
+    knowledge, not a claim about this patient, and shouldn't need a tool
+    call to back it. Confirms the range exclusion
+    (_LAB_VALUE_RANGE_PREFIX_RE) works end-to-end through verify_response():
+    a reference-range mention survives untouched, and -- the control that
+    proves this isn't a blanket weakening -- a genuinely fabricated value
+    elsewhere in the same response is still caught.
+    """
+    observations = GetRecentObservationsOutput(
+        patient_id=f.PID1_ALICE,
+        observations=[
+            ObservationFact(
+                text="Potassium",
+                value="5.8 mEq/L",
+                status="final",
+                effective_datetime="2026-09-18T02:00:00Z",
+                source_resource="Observation/fixture-potassium-1",
+            )
+        ],
+    )
+    record = ToolCallRecord(tool_name="get_recent_observations", patient_id=f.PID1_ALICE, output=observations)
+
+    draft = (
+        "Her most recent potassium was 5.8 mEq/L, which is elevated -- above the typical "
+        "normal range (~3.5-5.0 mEq/L). This should be correlated clinically."
+    )
+    outcome = verify_response(draft, [record], f.PID1_ALICE, fhir)
+    if outcome.flagged_claims:
+        return False, (
+            "the reference-range mention (5.0 mEq/L, the range's upper bound) was incorrectly "
+            f"flagged as an unverified patient-specific claim, got flagged_claims={outcome.flagged_claims}"
+        )
+    if draft not in outcome.final_response:
+        return False, "the reference-range context was stripped from the response instead of surviving untouched"
+
+    fabricated_draft = (
+        "Her most recent potassium was 5.8 mEq/L, and her sodium was 200 mEq/L, which is "
+        "critically abnormal."
+    )
+    fabricated_outcome = verify_response(fabricated_draft, [record], f.PID1_ALICE, fhir)
+    if not any("200" in c for c in fabricated_outcome.flagged_claims):
+        return False, (
+            "control failed: a genuinely fabricated value (200 mEq/L sodium, not in the tool "
+            f"output, not part of a range) should still be flagged, got "
+            f"flagged_claims={fabricated_outcome.flagged_claims}"
+        )
+
+    return True, "a reference-range mention survives untouched, and a genuinely fabricated value elsewhere is still caught"
 
 
 # --- (c) app/sensitivity.py -- pure functions, no FHIR/network needed at all,
@@ -341,6 +456,8 @@ TESTS: list[tuple[str, Callable[[FhirClient], tuple[bool, str]]]] = [
     ("check_allergy_conflict_cross_reactive_scoped_to_curated_classes", test_check_allergy_conflict_cross_reactive_scoped_to_curated_classes),
     ("verification_strips_ungrounded_claim", test_verification_strips_ungrounded_claim),
     ("verification_passes_grounded_claim", test_verification_passes_grounded_claim),
+    ("lab_value_grounding_tolerates_formatting", test_lab_value_grounding_tolerates_formatting),
+    ("lab_value_range_mention_not_flagged", test_lab_value_range_mention_not_flagged),
     ("sensitivity_filter_excludes_high_for_clin", test_sensitivity_filter_excludes_high_for_clin),
     ("sensitivity_filter_allows_high_for_doc", test_sensitivity_filter_allows_high_for_doc),
     ("domain_constraint_backstop_survives_missing_patient_id", test_domain_constraint_backstop_survives_missing_patient_id),

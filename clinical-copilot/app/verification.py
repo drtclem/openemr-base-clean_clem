@@ -85,6 +85,21 @@ _LAB_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Excludes a lab/vital value from candidacy when it's the upper bound of a
+# stated "X-Y unit" range (e.g. "normal range (~3.5-5.0 mEq/L)") -- found
+# live, the same day _LAB_VALUE_RE itself was added: a model correctly
+# citing a normal reference range alongside the real patient value got its
+# OWN reference-range mention stripped as an "unverified claim", since a
+# range's upper bound is exactly as number+unit-shaped as a genuine
+# patient-specific value and nothing distinguished them. A reference range
+# is general medical knowledge, not a claim about this patient, and
+# shouldn't be held to the same "must come from a tool" bar. Unlike a
+# fabricated medication name, a lab value's harm surface leans toward
+# false positives (stripping real, useful clinical context) rather than
+# false negatives (missing a fabricated value) being the primary risk --
+# this exclusion accepts a small amount of the latter to avoid the former.
+_LAB_VALUE_RANGE_PREFIX_RE = re.compile(r"\d+(\.\d+)?\s*[-‐-―]\s*$")
+
 # Common clinical abbreviations that won't literally substring-match the
 # expanded form a tool returns (e.g. a model saying "COPD" against a
 # Condition.text of "Chronic obstructive pulmonary disease"). Caught this via
@@ -236,7 +251,11 @@ def _find_candidate_terms(text: str) -> list[str]:
     lowered = text.lower()
     found = [term for term in _ALL_TERMS if term in lowered]
     found += [m.group(1) for m in _DOSE_RE.finditer(text)]
-    found += [m.group(0) for m in _LAB_VALUE_RE.finditer(text)]
+    found += [
+        m.group(0)
+        for m in _LAB_VALUE_RE.finditer(text)
+        if not _LAB_VALUE_RANGE_PREFIX_RE.search(text[: m.start()])
+    ]
     # de-dupe, case-insensitive
     seen: set[str] = set()
     unique = []
