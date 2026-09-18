@@ -10,7 +10,7 @@
   (`get_patient_snapshot`, `check_allergy_conflict`) and `verification.py`'s
   stripping logic, independent of whether the model behaves well on any
   given day. Free and instant, so there's no reason not to run it constantly.
-- **`evals/cases.py`** (the 8 cases below) -- exercises the agent's actual
+- **`evals/cases.py`** (the 9 cases below) -- exercises the agent's actual
   LLM behavior, real Anthropic calls, costs real spend per run. Triggered
   manually / before deploys (`python3 -m evals.run_evals`), not on every
   commit.
@@ -24,7 +24,7 @@ verification change).
 
 ## Golden Set vs. Behavioral Coverage
 
-The current 8 LLM-based cases in `evals/cases.py` are, by definition, a
+The current 9 LLM-based cases in `evals/cases.py` are, by definition, a
 **Golden Set**: small, every case expected to pass, correctness-focused --
 each one pins down a specific known fact, invariant, or prior finding, and a
 failure means something genuinely broke. This is deliberately not yet
@@ -136,7 +136,7 @@ worthwhile, following the same process (read real traces, name failure
 modes in plain language, then cluster), not by inventing more cases from a
 checklist.
 
-**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 8 cases
+**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 9 cases
 as a persisted Langfuse Dataset (one item per case, keyed by case name for
 idempotent re-creation) so pass-rate history becomes a visible trend across
 runs in the Langfuse UI (Datasets/Experiments in the sidebar), not just a
@@ -171,10 +171,11 @@ is a synthesis/formatting pass over what's already there, not new analysis.
 | `pid2_normal_snapshot` | invariant | 1 (rapid orientation) | ARCHITECTURE.md 3.1 (source-attribution invariant, second data shape) |
 | `pid3_empty_chart` | regression | 1 (rapid orientation) | AUDIT.md data-quality finding (empty chart renders with no warning) |
 | `pid6_duplicate_conflicting_dose` | regression | 2 (verify instruction against current chart) | AUDIT.md duplicate-patient finding (no physician warning, conflicting doses) |
-| `adversarial_unverifiable_claim` | adversarial | 1 (rapid orientation) | KEY_METRICS.md North Star (verification pass rate) |
+| `adversarial_unverifiable_claim` | invariant | 1 (rapid orientation) | KEY_METRICS.md North Star (verification pass rate) |
 | `domain_constraint_allergy_hard_block` | invariant | 3 (time-critical synthesis, allergy check before empiric order) | ARCHITECTURE.md 3.2 + AUDIT.md Finding 11 (uncoded allergy data-fidelity) |
 | `malformed_patient_id` | boundary | 1 (rapid orientation -- `get_patient_snapshot` backs use cases 1, 3 per ARCHITECTURE.md 2) | ARCHITECTURE.md Section 2/4 (tool-failure surfacing) |
 | `ambiguous_query_unspecified_medication` | boundary | 3 (allergy check before giving/continuing a medication -- `check_allergy_conflict` backs use cases 2, 3 per ARCHITECTURE.md 2) | PRD Evaluation requirement (ambiguous queries) |
+| `oauth_scope_enforcement_denied` | invariant | -- (Phase 1 auth invariant, not a USERS.md clinical use case) | CLAUDE_CODE_BUILD_INSTRUCTIONS.md Phase 1 + ARCHITECTURE.md 1.3 (a token's granted OAuth scope must actually bound what it can fetch) |
 
 USERS.md use-case mapping note: where a case's `guards_against` text doesn't
 name a use case explicitly, the mapping above follows ARCHITECTURE.md
@@ -182,24 +183,82 @@ Section 2's tool table (`get_patient_snapshot` -> use cases 1, 3;
 `check_allergy_conflict` -> use cases 2, 3) plus the case's own message
 content. No case here exercises use case 4 (end-of-shift summary) --
 consistent with USERS.md itself flagging that as lower-priority, build-only-
-if-time-allows.
+if-time-allows. `oauth_scope_enforcement_denied` is the one exception to
+this mapping scheme entirely: it's an auth-layer invariant (Phase 1,
+`CLAUDE_CODE_BUILD_INSTRUCTIONS.md`), not a clinical use case, so it has no
+USERS.md mapping by design, not by omission.
 
-## PRD Evaluation requirement coverage
+## Category schema (boundary / invariant / regression)
 
-The PRD's Evaluation section calls out four categories: missing data,
-ambiguous queries, unauthorized access, general regression.
+Three categories, per `ARCHITECTURE.md` 7.1. A fourth, `adversarial`, was
+retired 2026-09-17 (`CLAUDE_CODE_BUILD_INSTRUCTIONS.md` Phase 3,
+eval-category consolidation) -- `adversarial_unverifiable_claim` is tagged
+`invariant` now (tag-only change: its check function and behavior are
+unchanged, it always tested an invariant -- "no ungrounded claim survives
+unflagged" -- the old label just named its *style* of question, not its
+category). This also retires the PRD's separate "missing data / ambiguous
+queries / unauthorized access / general regression" framing that used to
+live in this section -- folded into the three categories below instead of
+tracked as a parallel taxonomy.
 
-- **Missing data** -- covered by `pid3_empty_chart` (empty chart) and
-  `malformed_patient_id` (tool failure / unresolvable patient).
-- **Ambiguous queries** -- covered by `ambiguous_query_unspecified_medication`.
-- **Unauthorized access** -- **not covered.** This is a direct consequence of
-  the password-grant auth gap (README.md's Known Gaps): the current build
-  authenticates as a single service credential, not a resident's own session,
-  so there is no per-requester permission boundary yet to test an
-  unauthorized-access attempt against. This becomes testable once the
-  authorization_code migration is complete.
-- **General regression** -- covered by `pid1_normal_snapshot`,
-  `pid2_normal_snapshot`, `pid6_duplicate_conflicting_dose`,
-  `adversarial_unverifiable_claim`, and `domain_constraint_allergy_hard_block`,
-  each pinned to a specific prior finding or architectural invariant so a
-  future change can't silently reintroduce it.
+- **`boundary`** -- edge/malformed input: does the agent degrade honestly at
+  the edges (empty chart, unresolvable patient, underspecified query)
+  rather than crashing or guessing. Examples: `malformed_patient_id`
+  (the PRD's old "missing data"), `ambiguous_query_unspecified_medication`
+  (the PRD's old "ambiguous queries").
+- **`invariant`** -- a property that must hold every time, enforced in
+  code, not model judgment (`ARCHITECTURE.md` 3.2's "a wall, not a
+  request"). Examples: `pid1_normal_snapshot`/`pid2_normal_snapshot`
+  (source-attribution), `domain_constraint_allergy_hard_block` (allergy
+  hard-block), `adversarial_unverifiable_claim` (no ungrounded claim
+  survives unflagged), `oauth_scope_enforcement_denied` (a token's granted
+  OAuth scope actually bounds what it can fetch -- the closest thing this
+  suite has to the PRD's old "unauthorized access," though narrower: it
+  tests an out-of-*scope* fetch, not an out-of-*panel* one -- see Known
+  Scenario Gaps below).
+- **`regression`** -- pinned to a specific prior finding so a future change
+  can't silently reintroduce it. Examples: `pid3_empty_chart`,
+  `pid6_duplicate_conflicting_dose`.
+
+## Known Scenario Gaps
+
+Tracked separately from the category table, not folded into it -- these are
+real scenarios with no eval case today, named explicitly rather than
+silently absent:
+
+- **Cross-provider patient-panel access.** `audit-notes.md` confirmed live
+  in the OpenEMR UI that a physician (`dr_1`) could fully open, edit, and
+  create encounters on another provider's patient (pid 4, admin's) -- a
+  real, unfixed platform-level ACL gap (`README.md` Known Gaps,
+  `THREAT_MODEL.md` 4.3). `oauth_scope_enforcement_denied` deliberately does
+  **not** test this: it proves a resource *type* outside a token's granted
+  scope is denied, not that a specific *patient* outside a resident's own
+  panel is denied -- OpenEMR's own ACL doesn't enforce that boundary today,
+  so an eval case here would either falsely fail (correctly exposing the
+  platform gap) or have to pick a boundary that happens to pass, which
+  would misrepresent what's actually enforced. No case exists because the
+  boundary itself doesn't exist yet, not because it was missed.
+- **Encounter sensitivity filtering** (`app/sensitivity.py`) is built and
+  unit-tested in isolation (`evals/unit_tests.py`'s
+  `test_sensitivity_filter_excludes_high_for_clin`/`_allows_high_for_doc`),
+  but has no LLM-behavior case here yet -- `get_recent_encounters`, the
+  tool that would actually call it, isn't built (a later phase per
+  `CLAUDE_CODE_BUILD_INSTRUCTIONS.md`). Nothing to exercise end-to-end
+  until that tool exists.
+- **Conversation ownership / session binding** (`THREAT_MODEL.md` 4.7):
+  `conversation_id` isn't bound to the authenticated session that created
+  it, and `_conversations` (`app/main.py`) is a single unscoped
+  process-wide dict. No eval case tests either.
+
+## Unit-tier invariant checks (`evals/unit_tests.py`)
+
+Two invariants live in the LLM-free suite instead of here because they're
+deterministic reproductions with no model call needed to prove the guard
+fires -- a better fit than the LLM-behavior suite per `evals/unit_tests.py`'s
+own docstring. Listed here so they appear in this coverage matrix, not only
+in test-runner output:
+
+| Test | Category (informal) | Guards against |
+|---|---|---|
+| `test_domain_constraint_backstop_survives_missing_patient_id` | invariant | The hard-coded allergy-conflict backstop must fire even when `/chat` omits `patient_id` -- previously silently skipped, reporting `verification_passed: true` on a real, uncaught conflict (`THREAT_MODEL.md` 4.1, fixed commit `ff18c21`). |
+| `test_cross_patient_tool_call_blocked` | invariant | A tool call's `patient_id` must match the conversation's declared active patient before the real FHIR read executes -- previously unenforced, an agent-mediated IDOR (`THREAT_MODEL.md` 4.2, fixed commit `ff18c21`). |
