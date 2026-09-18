@@ -227,9 +227,14 @@ collection was committed.
 - **Domain constraint / duplicate / empty-chart enforcement all assume a
   single active patient per turn** (the `patient_id` passed to `/chat`).
   Multi-patient conversations in one turn aren't handled.
-- **`check_allergy_conflict` is a substring match**, not a drug-class
-  knowledge base -- it will not catch e.g. amoxicillin against a documented
-  penicillin allergy. Documented in `app/tools.py`.
+- **`check_allergy_conflict` catches direct name matches plus a small,
+  curated cross-reactivity table** (`app/clinical_reference.py`, Phase 5) --
+  it now catches amoxicillin against a documented penicillin allergy, but
+  only for the classes actually curated there (penicillins today). It is
+  explicitly not a drug-class knowledge base or a substitute for a
+  production drug-interaction database (First Databank/Medi-Span/
+  Multum-style) -- a proposed medication in an uncurated class still isn't
+  caught. Documented in `app/tools.py` and `ARCHITECTURE.md` 3.2.
 - **Conversation state is in-memory**, single-process. Fine for this demo,
   not for more than one server instance.
 - Only the two tools in scope for Early Submission are implemented

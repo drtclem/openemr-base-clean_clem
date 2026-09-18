@@ -21,6 +21,7 @@ import sys
 import time
 from pathlib import Path
 
+from evals.cases import ALL_CASES
 from evals.run_behavioral_coverage import run_behavioral_suite
 from evals.run_evals import check_gate, run_golden_set
 from evals.unit_tests import run_all_tests
@@ -76,7 +77,7 @@ def main() -> int:
     unit_total = len(unit_results)
     unit_passed = sum(1 for _, p, _ in unit_results if p)
 
-    print("Running Golden Set (8 cases, real Anthropic calls)...")
+    print(f"Running Golden Set ({len(ALL_CASES)} cases, real Anthropic calls)...")
     golden_results = run_golden_set()
     golden_total = len(golden_results)
     golden_passed = sum(1 for r in golden_results if r["passed"])

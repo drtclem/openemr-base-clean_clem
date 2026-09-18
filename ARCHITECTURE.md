@@ -176,6 +176,21 @@ allergies, it makes an allergy-conflicting response structurally impossible to c
 distinction matters: a prompt instruction can be forgotten or reasoned around; a code-level check
 cannot.
 
+**Phase 5 addition (cross-reactivity), 2026-09-17:** `check_allergy_conflict`'s allergy match was,
+until now, a direct/substring comparison only -- it could not catch a proposed medication that is a
+*different* drug in the same class as a recorded allergy (e.g. amoxicillin against a documented
+penicillin allergy), because that relationship is general pharmacology, not something any FHIR
+resource for the patient states. `clinical-copilot/app/clinical_reference.py` adds a small, curated
+drug-class table (`DRUG_CLASSES`) that `check_allergy_conflict` also checks, scoped to just the
+classes the demo patients need, starting with penicillins. **This table is explicitly a stand-in
+for a production drug-interaction database (First Databank/Medi-Span/Multum-style), not a claim of
+full clinical decision-support integration** -- it is sized to this project's fixture data, not
+general pharmacology, and a real deployment must replace it with a licensed, maintained reference
+before this touches real patients. The tool's output now reports `cross_reactive_class` explicitly
+(non-`None` only when the match came from this table rather than a direct name match), so a
+resident-facing response and this system's own logs can distinguish the two rather than presenting
+an inferred class relationship as if it were an exact match on the chart.
+
 ## 3.3 Sensitivity compensating control
 
 Confirmed necessary, not just deliberately redundant (Section 1.3): a resident's own `user/`-scoped

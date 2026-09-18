@@ -10,7 +10,7 @@
   (`get_patient_snapshot`, `check_allergy_conflict`) and `verification.py`'s
   stripping logic, independent of whether the model behaves well on any
   given day. Free and instant, so there's no reason not to run it constantly.
-- **`evals/cases.py`** (the 9 cases below) -- exercises the agent's actual
+- **`evals/cases.py`** (the 10 cases below) -- exercises the agent's actual
   LLM behavior, real Anthropic calls, costs real spend per run. Triggered
   manually / before deploys (`python3 -m evals.run_evals`), not on every
   commit.
@@ -24,7 +24,7 @@ verification change).
 
 ## Golden Set vs. Behavioral Coverage
 
-The current 9 LLM-based cases in `evals/cases.py` are, by definition, a
+The current 10 LLM-based cases in `evals/cases.py` are, by definition, a
 **Golden Set**: small, every case expected to pass, correctness-focused --
 each one pins down a specific known fact, invariant, or prior finding, and a
 failure means something genuinely broke. This is deliberately not yet
@@ -178,7 +178,7 @@ worthwhile, following the same process (read real traces, name failure
 modes in plain language, then cluster), not by inventing more cases from a
 checklist.
 
-**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 9 cases
+**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 10 cases
 as a persisted Langfuse Dataset (one item per case, keyed by case name for
 idempotent re-creation) so pass-rate history becomes a visible trend across
 runs in the Langfuse UI (Datasets/Experiments in the sidebar), not just a
@@ -215,6 +215,7 @@ is a synthesis/formatting pass over what's already there, not new analysis.
 | `pid6_duplicate_conflicting_dose` | regression | 2 (verify instruction against current chart) | AUDIT.md duplicate-patient finding (no physician warning, conflicting doses) |
 | `adversarial_unverifiable_claim` | invariant | 1 (rapid orientation) | KEY_METRICS.md North Star (verification pass rate) |
 | `domain_constraint_allergy_hard_block` | invariant | 3 (time-critical synthesis, allergy check before empiric order) | ARCHITECTURE.md 3.2 + AUDIT.md Finding 11 (uncoded allergy data-fidelity) |
+| `domain_constraint_cross_reactive_allergy` | invariant | 3 (time-critical synthesis, allergy check before empiric order) | ARCHITECTURE.md 3.2 Phase 5 addition (`app/clinical_reference.py`): the allergy-conflict wall must also catch a cross-reactive drug-class match, not only an exact allergy-name match |
 | `malformed_patient_id` | boundary | 1 (rapid orientation -- `get_patient_snapshot` backs use cases 1, 3 per ARCHITECTURE.md 2) | ARCHITECTURE.md Section 2/4 (tool-failure surfacing) |
 | `ambiguous_query_unspecified_medication` | boundary | 3 (allergy check before giving/continuing a medication -- `check_allergy_conflict` backs use cases 2, 3 per ARCHITECTURE.md 2) | PRD Evaluation requirement (ambiguous queries) |
 | `oauth_scope_enforcement_denied` | invariant | -- (Phase 1 auth invariant, not a USERS.md clinical use case) | CLAUDE_CODE_BUILD_INSTRUCTIONS.md Phase 1 + ARCHITECTURE.md 1.3 (a token's granted OAuth scope must actually bound what it can fetch) |
@@ -294,7 +295,7 @@ silently absent:
 
 ## Unit-tier invariant checks (`evals/unit_tests.py`)
 
-Two invariants live in the LLM-free suite instead of here because they're
+Invariants live in the LLM-free suite instead of here because they're
 deterministic reproductions with no model call needed to prove the guard
 fires -- a better fit than the LLM-behavior suite per `evals/unit_tests.py`'s
 own docstring. Listed here so they appear in this coverage matrix, not only
@@ -304,3 +305,5 @@ in test-runner output:
 |---|---|---|
 | `test_domain_constraint_backstop_survives_missing_patient_id` | invariant | The hard-coded allergy-conflict backstop must fire even when `/chat` omits `patient_id` -- previously silently skipped, reporting `verification_passed: true` on a real, uncaught conflict (`THREAT_MODEL.md` 4.1, fixed commit `ff18c21`). |
 | `test_cross_patient_tool_call_blocked` | invariant | A tool call's `patient_id` must match the conversation's declared active patient before the real FHIR read executes -- previously unenforced, an agent-mediated IDOR (`THREAT_MODEL.md` 4.2, fixed commit `ff18c21`). |
+| `test_check_allergy_conflict_cross_reactive` | invariant | `check_allergy_conflict` must flag amoxicillin against pid1's documented penicillin allergy via the curated drug-class table (`app/clinical_reference.py`, Phase 5), not only a direct/substring name match. |
+| `test_check_allergy_conflict_cross_reactive_scoped_to_curated_classes` | invariant | The cross-reactivity table must not over-fire outside its curated scope -- a medication in no curated class and not a direct match (metformin) must still report no conflict. |

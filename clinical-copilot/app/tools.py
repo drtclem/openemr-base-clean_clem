@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 
+from app.clinical_reference import cross_reactive_class
 from app.fhir_client import FhirClient, FhirRequestError, bundle_entries
 from app.schemas import (
     AllergyFact,
@@ -219,6 +220,7 @@ def check_allergy_conflict(fhir: FhirClient, raw_input: dict) -> CheckAllergyCon
     entries = bundle_entries(bundle)
     med_norm = params.medication_name.strip().lower()
     matched_text: str | None = None
+    matched_cross_reactive_class: str | None = None
     low_confidence = False
     source_resources: list[str] = []
 
@@ -231,11 +233,20 @@ def check_allergy_conflict(fhir: FhirClient, raw_input: dict) -> CheckAllergyCon
         allergy_norm = text.strip().lower()
         if not allergy_norm or allergy_norm == "unknown":
             continue
-        # Simple substring match, deliberately not a drug-class knowledge base
-        # (e.g. this will NOT catch "amoxicillin" against a "penicillin"
-        # allergy) -- documented as a known limitation, not assumed away.
-        if med_norm in allergy_norm or allergy_norm in med_norm:
+        # (a) Simple substring match against the allergy text itself.
+        # (b) A small, curated drug-class cross-reactivity table
+        # (app/clinical_reference.py) -- e.g. "amoxicillin" against a
+        # documented "penicillin" allergy. That table is a scoped stand-in
+        # for a production drug-interaction database (First Databank/
+        # Medi-Span/Multum-style), not general clinical decision support;
+        # see its module docstring. Neither (a) nor (b) is a drug-class
+        # knowledge base beyond what's curated there -- a class this table
+        # doesn't cover is still a known limitation, not assumed away.
+        direct_match = med_norm in allergy_norm or allergy_norm in med_norm
+        matched_class = None if direct_match else cross_reactive_class(allergy_norm, med_norm)
+        if direct_match or matched_class:
             matched_text = text
+            matched_cross_reactive_class = matched_class
             if not is_coded:
                 low_confidence = True
             source_resources.append(f"AllergyIntolerance/{res.get('id')}")
@@ -245,6 +256,7 @@ def check_allergy_conflict(fhir: FhirClient, raw_input: dict) -> CheckAllergyCon
         medication_name=params.medication_name,
         conflict_found=matched_text is not None,
         matched_allergy_text=matched_text,
+        cross_reactive_class=matched_cross_reactive_class,
         checked_allergy_count=len(entries),
         low_confidence=low_confidence,
         source_resources=source_resources,

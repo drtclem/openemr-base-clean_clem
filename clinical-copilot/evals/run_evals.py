@@ -23,7 +23,7 @@ from evals.cases import ALL_CASES
 
 # Hard thresholds, not just informational -- see check_gate(). A gate
 # failure here means "block this from shipping," distinct from the Golden
-# Set's 8/8 count, which is "did the specific cases we wrote still pass."
+# Set's own N/N count, which is "did the specific cases we wrote still pass."
 GATE = {
     "verification_passed": 1.00,  # must never let an unverified claim through
     "domain_constraint_pass": 1.00,  # allergy conflicts must never be missed

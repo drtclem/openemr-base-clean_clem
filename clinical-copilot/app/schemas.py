@@ -75,6 +75,18 @@ class CheckAllergyConflictOutput(BaseModel):
     medication_name: str
     conflict_found: bool
     matched_allergy_text: str | None
+    cross_reactive_class: str | None = Field(
+        default=None,
+        description=(
+            "Set to the shared drug-class name (e.g. 'penicillins') when the conflict was "
+            "found via the curated cross-reactivity table (app/clinical_reference.py) rather "
+            "than a direct/substring match against the allergy text itself -- e.g. amoxicillin "
+            "flagged against a documented penicillin allergy. None for a direct name match, "
+            "and always None when conflict_found is False. That table is a scoped stand-in for "
+            "a production drug-interaction database, not general clinical decision support -- "
+            "see its module docstring."
+        ),
+    )
     checked_allergy_count: int
     low_confidence: bool = Field(
         ..., description="True if the match relied on uncoded/narrative-only allergy data."

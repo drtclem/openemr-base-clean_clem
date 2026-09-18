@@ -90,6 +90,37 @@ def test_check_allergy_conflict_negative(fhir: FhirClient) -> tuple[bool, str]:
     return True, "known non-conflict (pid1 + metformin) correctly not flagged"
 
 
+def test_check_allergy_conflict_cross_reactive(fhir: FhirClient) -> tuple[bool, str]:
+    """Phase 5 (app/clinical_reference.py): pid1's documented penicillin
+    allergy must also flag amoxicillin -- a different drug in the same
+    curated 'penicillins' class -- even though "amoxicillin" never appears
+    in the allergy text itself, so this can only pass via the cross-
+    reactivity table, not the pre-existing direct/substring match."""
+    result = check_allergy_conflict(fhir, {"patient_id": f.PID1_ALICE, "medication_name": "amoxicillin"})
+    if not isinstance(result, CheckAllergyConflictOutput):
+        return False, f"expected a conflict result, got a tool failure: {result}"
+    if not result.conflict_found:
+        return False, "pid1's penicillin allergy should cross-flag amoxicillin (same drug class); got conflict_found=False"
+    if result.cross_reactive_class != "penicillins":
+        return False, f"expected cross_reactive_class='penicillins', got {result.cross_reactive_class!r}"
+    return True, "amoxicillin correctly flagged via the curated penicillin cross-reactivity table"
+
+
+def test_check_allergy_conflict_cross_reactive_scoped_to_curated_classes(fhir: FhirClient) -> tuple[bool, str]:
+    """The cross-reactivity table is a scoped stand-in, not a general
+    drug-class knowledge base -- a medication in no curated class, and not
+    a direct/substring match, must still come back as no conflict rather
+    than the table silently over-firing."""
+    result = check_allergy_conflict(fhir, {"patient_id": f.PID1_ALICE, "medication_name": "metformin"})
+    if not isinstance(result, CheckAllergyConflictOutput):
+        return False, f"expected a conflict result, got a tool failure: {result}"
+    if result.conflict_found:
+        return False, "metformin is in no curated drug class and isn't a substring match; expected conflict_found=False"
+    if result.cross_reactive_class is not None:
+        return False, f"expected cross_reactive_class=None for a non-conflict, got {result.cross_reactive_class!r}"
+    return True, "medication outside every curated class correctly reported no conflict"
+
+
 # --- (c) verification.py's stripping logic, no LLM involved ----------------
 
 
@@ -256,6 +287,8 @@ TESTS: list[tuple[str, Callable[[FhirClient], tuple[bool, str]]]] = [
     ("get_patient_snapshot_pid2", test_get_patient_snapshot_pid2),
     ("check_allergy_conflict_positive", test_check_allergy_conflict_positive),
     ("check_allergy_conflict_negative", test_check_allergy_conflict_negative),
+    ("check_allergy_conflict_cross_reactive", test_check_allergy_conflict_cross_reactive),
+    ("check_allergy_conflict_cross_reactive_scoped_to_curated_classes", test_check_allergy_conflict_cross_reactive_scoped_to_curated_classes),
     ("verification_strips_ungrounded_claim", test_verification_strips_ungrounded_claim),
     ("verification_passes_grounded_claim", test_verification_passes_grounded_claim),
     ("sensitivity_filter_excludes_high_for_clin", test_sensitivity_filter_excludes_high_for_clin),
