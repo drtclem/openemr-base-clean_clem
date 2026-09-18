@@ -1,0 +1,556 @@
+# Threat Model: Clinical Co-Pilot
+
+Read-only structured analysis. No fixes applied here — findings only, for
+review. Written against the Early Submission build in `app/` as of commit
+`22b7fcd`, cross-referenced against the design intent in `../ARCHITECTURE.md`
+and the honestly-documented gaps in `README.md`'s "Known gaps" section.
+
+## Scope and method
+
+Walked the system as: assets worth protecting → trust boundaries the data
+crosses → who can stand on which side of each boundary → what happens if
+they act adversarially there. Every threat below is backed by a specific
+`file:line` citation, not a generic category. Four areas were driven
+specifically per this review's request: indirect prompt injection via
+uncoded chart text, the resident-scoped auth work (not yet present in this
+repo), edge cases in the cross-patient guard, and a supply-chain/crypto
+spot-check. The rest of the findings surfaced while tracing data flow for
+those four and are included because they bear directly on the same trust
+boundaries.
+
+Likelihood/impact are rated Low/Medium/High/Critical, informally — this is a
+solo-project threat model, not a formal risk register.
+
+## 1. System overview and trust boundaries
+
+```
+ [Resident's browser / any HTTP client]
+            │  (1) unauthenticated HTTP — no session, no API key
+            ▼
+ ┌───────────────────────────── FastAPI process (app/main.py) ─────────────┐
+ │  POST /chat, GET /ui, /health, /ready                                    │
+ │            │ (2) in-memory _conversations dict, keyed by client-supplied │
+ │            │     conversation_id — no ownership binding                 │
+ │            ▼                                                            │
+ │  ClinicalCopilotAgent (app/agent.py) — tool-calling loop                 │
+ │            │ (3) model chooses tool args freely from conversation text  │
+ │            ▼                                                            │
+ │  tools.py: get_patient_snapshot / check_allergy_conflict                │
+ │            │ (4) FhirClient, one shared service credential (auth.py)    │
+ └────────────┼─────────────────────────────────────────────────────────---┘
+              ▼
+      OpenEMR FHIR API  ──(5)── OpenEMR DB (uncoded free-text fields live here)
+              │
+              ▼
+      Anthropic API (6)         Self-hosted Langfuse + stdout logs (7)
+```
+
+Numbered boundaries referenced throughout:
+
+1. **Public/client boundary** — currently *no* authentication. Anyone who
+   can reach the port is inside.
+2. **Conversation-identity boundary** — a client-supplied UUID is the only
+   thing separating one conversation's accumulated tool-fetched PHI from
+   another's.
+3. **Model/tool boundary** — the LLM decides what arguments (`patient_id`,
+   `medication_name`) to pass to real, data-fetching tools. This is the
+   classic agentic trust boundary: everything on the far side of it is
+   attacker-influenceable if anything upstream of it is attacker-influenced.
+4. **Service-credential boundary** — one password-grant OAuth credential
+   (not per-resident) mediates every fetch, per `app/auth.py`'s own
+   docstring.
+5. **Content-provenance boundary** — OpenEMR chart data, including uncoded
+   free-text fields anyone with chart-write access can populate, crosses
+   into the model's context as plain, undelimited text.
+6. **Egress to Anthropic** — turn content leaves the process boundary.
+7. **Observability boundary** — full tool inputs/outputs (PHI) are written
+   to stdout and to a self-hosted Langfuse instance.
+
+## 2. Assets
+
+- Patient PHI (conditions, medications, allergies, demographics, narrative
+  free text) reachable via the FHIR API.
+- The OAuth service credential (`app/auth.py`) and its FHIR read scope.
+- The Anthropic API key and account spend ceiling.
+- The integrity of the verification layer's two guarantees (source
+  attribution, domain-constraint hard-block) — this is the system's actual
+  safety case, per `ARCHITECTURE.md` §3.2's "a wall, not a request."
+- Conversation state (`_conversations` in `app/main.py:92`) — PHI already
+  fetched persists here across turns.
+
+## 3. Adversaries considered
+
+- **Unauthenticated internet client** — the droplet's `/chat` and `/ui` are
+  confirmed publicly reachable with zero auth (`README.md` "Known gaps",
+  and `docker`'s `ufw allow 8420/tcp`). This is today's actual, live
+  adversary position, not a hypothetical.
+- **A chart author with uncoded-field write access** — front-desk staff, a
+  compromised OpenEMR account, or any legitimate workflow that writes
+  free-text into `Condition.text`, `AllergyIntolerance.text.div`, or a
+  `MedicationRequest` dosage instruction. OpenEMR's own data model permits
+  this; nothing about the Co-Pilot changes who can write there.
+- **A resident (or anyone with a valid conversation)** attempting to reach
+  data outside their own authorization scope by manipulating chat content
+  rather than by breaking auth directly.
+- **Passive observer of logs/telemetry** — anyone with access to stdout
+  logs or the Langfuse instance.
+
+---
+
+## 4. Findings
+
+### 4.1 Cross-patient guard: the domain-constraint wall silently disables when `patient_id` is omitted — **Critical, Fixed 2026-09-17**
+
+This is the most severe finding in this pass, and it's a correctness bug in
+the exact control `ARCHITECTURE.md` §3.2 calls "a wall, not a request."
+
+`ChatRequest.patient_id` is optional (`app/main.py:97`, `str | None = None`
+— this is valid, schema-legal input). When it's omitted:
+
+- `run_turn` receives `patient_id=None`. The "[Active patient
+  context...]" text is only prepended `if patient_id:` (`app/agent.py:141`)
+  — so the harness gives the model no explicit patient, but **nothing stops
+  the model from extracting a patient UUID out of the free-text user
+  message itself** and calling a tool with it anyway (tool schemas just
+  require `patient_id: string`, `app/agent.py:56-74`). The tool executes
+  for real against that patient.
+- At grounding time: `records_for_active_patient = [r for r in turn_records
+  if r.patient_id == patient_id]` (`app/agent.py:218`). Since real tool
+  records always carry a non-`None` `patient_id` string, and the outer
+  `patient_id` here is `None`, **this filter always evaluates to an empty
+  list** whenever the request omitted `patient_id` — regardless of what the
+  model actually fetched.
+- That empty list is passed into `verify_response(...)`
+  (`app/agent.py:219`). Inside, `_check_domain_constraint` only runs
+  `if current_patient_id:` (`app/verification.py:254`). With
+  `current_patient_id=None`, **the entire allergy-conflict hard-block is
+  skipped**, and `passed_domain` keeps its initialized value of `True`
+  (`app/verification.py:253`, set before the guard and never reassigned
+  when the guard is false).
+- The turn result reports `passed_domain_constraint=True` — the system's
+  own North Star metric (`ARCHITECTURE.md` §7.4) records a **false
+  positive**: "verified safe" on a turn where the code-level allergy check
+  never ran at all.
+- The same empty-list plumbing means `_enforce_duplicate_and_empty_chart`
+  (`app/verification.py:213`) is also skipped for that turn — duplicate
+  patient and empty-chart warnings go silent too.
+
+**Attack/failure scenario:** an unauthenticated client (§3, boundary 1 —
+`/chat` has no auth today) sends `{"message": "check_allergy_conflict-style
+question naming patient 98c4b82b... and asking about starting penicillin",
+"patient_id": null}`. If the model resolves the patient from message text
+and answers without the harness's domain-constraint re-check ever firing,
+a real allergy conflict can reach the resident unblocked, while the
+response's own `verification_passed` field falsely reports `true`. This
+requires no exploit sophistication — omitting one optional JSON field is
+sufficient, and is available to any caller today given the public,
+unauthenticated port.
+
+**Likelihood: High** (one omitted field, no auth barrier). **Impact:
+Critical** (defeats the one control the architecture explicitly designed
+to be un-bypassable, and misreports the safety metric as passing).
+
+**Status: Fixed, commit `ff18c21`.** Re-verified live against this exact
+scenario before fixing (pid1's real, documented penicillin allergy, drafted
+response mentioning the medication without stating the conflict, request
+omitting `patient_id`) — confirmed `passed_domain_constraint`/
+`verification_passed` both incorrectly `True` with no `[HARD STOP]`,
+reproducing the table above exactly. `verify_response()`
+(`app/verification.py`) now falls back to the single patient this turn's
+own tool calls actually grounded data for when the request omits
+`patient_id`, instead of skipping the domain-constraint check outright.
+Re-verified fixed: the same scenario now correctly yields
+`passed_domain_constraint=False` and injects `[HARD STOP]`. Permanent
+regression test: `evals/unit_tests.py::test_domain_constraint_backstop_survives_missing_patient_id`.
+
+### 4.2 Cross-patient guard: tool execution isn't bound to the declared active patient (agent-mediated IDOR) — **High, Fixed 2026-09-17**
+
+Separate from 4.1: even when `patient_id` *is* supplied and matches, the
+guard at `app/agent.py:218` filters what's allowed to **ground the response
+text** — it does not gate what's allowed to **execute**. `_call_tool`
+(`app/agent.py:242-246`) runs whatever `block.input` the model produced,
+with no check that `block.input["patient_id"] == patient_id` (the
+declared/request-level patient). The model is free to call
+`get_patient_snapshot` or `check_allergy_conflict` for a *different*
+`patient_id` than the one the caller declared — for instance if the user
+message itself contains another UUID ("also check patient X for..."), or if
+content read from the currently-active patient's own chart (a condition
+note, an allergy narrative — see §4.4) references or steers toward another
+patient ID.
+
+When that happens, a real FHIR read executes under the single shared
+service credential (`app/auth.py`) against a patient the caller never
+declared and, under the current password-grant build, with no per-resident
+scoping to catch it (`README.md` "Known gaps": "NOT bound to an individual
+resident's session"). The fetched PHI:
+
+- Is excluded from grounding the *visible* response (4.1's filter does work
+  correctly in this direction), but
+- Already reached the LLM's context window for that turn (sent to
+  Anthropic, boundary 6), and
+- Is logged in full to Langfuse (`app/observability.py:147-152`,
+  `output_payload` includes the entire snapshot) and partially to stdout
+  (`app/observability.py:137-146`, tool input including the off-target
+  `patient_id`) — see §4.6.
+
+No audit trail attributes this access to an individual resident (one shared
+credential, per §4.3), so this is also an audit-integrity gap, not just a
+confidentiality one.
+
+**Likelihood: Medium-High** given the public, unauthenticated port and a
+broad-scope shared credential. **Impact: High** (unauthorized PHI read,
+unattributable in logs to a specific human).
+
+**Status: Fixed, commit `ff18c21`.** Re-verified live before fixing by
+calling `_call_tool` directly (bypassing the model entirely, for a
+deterministic reproduction) with the turn's declared active patient set to
+pid1 and the tool call's own `patient_id` argument set to pid4: the real
+FHIR read executed and returned pid4's real data (Dan Otherprovider, real
+conditions/medications), confirming the mismatch reached the network with
+nothing intercepting it. `_call_tool` (`app/agent.py`) now takes the turn's
+`active_patient_id` and rejects a mismatched tool-call `patient_id` with a
+`ToolFailure` (`detail_code="patient_mismatch"`) before dispatch. Re-run of
+the same reproduction after the fix: blocked before dispatch, no FHIR call
+made; a matching `patient_id` still succeeds normally (control case also
+verified). Permanent regression test:
+`evals/unit_tests.py::test_cross_patient_tool_call_blocked`.
+
+**Note on 4.3's own prediction:** 4.3's checklist below asked "does
+resident-scoping change 4.1/4.2's severity?" and predicted the answer would
+be no unless the new work added "an explicit 'declared active patient'
+enforcement point that doesn't exist today." Confirmed exactly right: the
+`authorization_code` migration (Phase 1) does not touch tool dispatch at
+all and does not add that enforcement point — it fixes *who is asking*
+(binds the FHIR token to a real, authenticated resident's session), not
+*which patient a tool call is allowed to target*. Those are orthogonal
+controls. This finding needed its own, separate fix (above), which is what
+actually closed it.
+
+### 4.3 Resident-scoped auth — landed 2026-09-17 (uncommitted); checklist below re-reviewed against it
+
+`app/auth.py` no longer implements only the password grant against one
+shared service credential for live traffic: Phase 1
+(`CLAUDE_CODE_BUILD_INSTRUCTIONS.md`, working tree as of this update, not
+yet committed) added a real `authorization_code` + PKCE login
+(`app/oauth_session.py`), binding `/chat`/`/ui`'s FHIR token to whichever
+resident actually authenticates. Password grant remains, scoped to the
+offline eval harness only (no browser available there).
+
+When the resident-scoped build lands, re-review against these specific
+points (each one traces to a stated-but-unverified property in
+`ARCHITECTURE.md`):
+
+- **Token binding.** Confirm the access token used for FHIR calls is
+  actually the token minted from *that specific resident's* authenticated
+  `authorization_code` exchange — not a token cached/shared across
+  requests or conversations (watch for a repeat of the current
+  `OAuthTokenProvider`'s single-instance-wide cache pattern,
+  `app/auth.py:39-42`, which is correct for one shared service credential
+  but would be a cross-resident token leak if reused unchanged for
+  per-resident tokens).
+- **Sensitivity filtering is unverified per the architecture doc itself**
+  (`ARCHITECTURE.md` §1.3, §3.3): confirm whether a `user/`-scoped token
+  actually enforces OpenEMR's sensitivity ACL, and whether the compensating
+  code-level filter described in §3.3 was actually implemented for
+  `get_patient_snapshot`/`check_allergy_conflict` (today, neither tool
+  applies any such filter — `app/tools.py` has no sensitivity check at
+  all).
+- **Does resident-scoping change §4.1/§4.2's severity? Answered: no.**
+  Confirmed exactly as predicted — the `authorization_code` migration does
+  not add a "declared active patient" enforcement point; it doesn't touch
+  tool dispatch at all. It fixes *who is asking* (a real, authenticated
+  resident's session backs the FHIR token) — an orthogonal control from
+  *which patient a tool call is allowed to target*. §4.2 needed, and got, a
+  separate, dedicated fix (see §4.2's updated status: commit `ff18c21`,
+  `_call_tool` now checks the tool call's `patient_id` against the turn's
+  declared active patient before dispatch). Cross-checked against the other
+  half of this bullet's prediction too — "a per-resident token likely still
+  grants read access to any patient the resident's role can see in OpenEMR
+  generally (not just 'their' patients)": Phase 1's own empirical testing
+  confirmed this is real, live, and unfixed by the auth migration.
+  `audit-notes.md` already showed this in the UI (`dr_1`, a different
+  provider, fully opening/editing/creating encounters on pid 4, admin's
+  patient); Phase 1 didn't re-test the FHIR path specifically for this, but
+  has no reason to expect the API enforces a boundary the UI itself
+  doesn't. Tracked as a separate, still-open, platform-level ACL gap in
+  `clinical-copilot/README.md`'s Known Gaps — not something either this
+  finding's fix or the auth migration closes.
+- **Callback/redirect endpoint.** `authorization_code` needs a real
+  `/callback` handler — confirm `state` is checked (CSRF on the OAuth
+  dance) and PKCE is used if the client type warrants it.
+- **Session/conversation binding.** Confirm the new work also closes §4.7
+  below (conversation ownership) — a real per-resident token with no
+  binding between `conversation_id` and the authenticated resident just
+  moves the same gap one layer up.
+- **Multi-resident conversation state.** `_conversations` (`app/main.py:92`)
+  is a single process-wide dict. Per-resident tokens sharing that same
+  unscoped store means a resident's authenticated session and another
+  resident's conversation contents are still adjacent in memory with no
+  isolation beyond the UUID key.
+
+**Status: Present (uncommitted), partially reviewed.** The two bullets this
+update addresses (IDOR severity, cross-provider role scope) are answered
+above. **Token binding** and **callback/redirect** are satisfied by the
+landed design (`ResidentSession` wraps a token seeded per-login,
+`app/oauth_session.py`; `state` + PKCE S256 checked in `/callback`) but
+not independently adversarially re-tested by this pass. **Session/
+conversation binding** (§4.7) and **multi-resident conversation state**
+remain unaddressed — `_conversations` in `app/main.py` is still a single
+unscoped process-wide dict with no binding to the authenticated resident;
+still flagged for mandatory review before this touches real patients.
+
+### 4.4 Indirect prompt injection via uncoded/free-text chart fields — **Medium-High, Partially mitigated**
+
+Uncoded chart content flows into the model's context as plain,
+undifferentiated text with only HTML-tag stripping applied
+(`_strip_html`, `app/tools.py:35-36`):
+
+- `AllergyFact.text`/`.reaction` can come from `AllergyIntolerance.text.div`
+  narrative when the structured code is a `data-absent-reason`
+  (`app/tools.py:161-166`) — this is exactly `ARCHITECTURE.md` Finding 11's
+  documented data-fidelity gap, and it's the same field the system
+  explicitly must trust because it's the *only* remaining record for an
+  uncoded allergy.
+- `MedicationFact.dosage_text` and `.text`, and `ConditionFact.text`, are
+  similarly narrative-derived when uncoded.
+
+This text is packed into `tool_result` content with no delimiter or
+provenance framing (`app/agent.py:199-205`: `json.dumps(_to_jsonable(output))`
+straight into `tool_use_id`/`content`), and the system prompt
+(`app/agent.py:24-43`) never states that tool-returned content may be
+attacker-influenced data rather than trustworthy clinical fact or
+instruction — a standard, cheap indirect-prompt-injection mitigation
+(explicitly marking retrieved content as untrusted data) is absent.
+
+**Why this is only partially mitigated, not wide open:**
+
+- The domain-constraint hard-block (`_check_domain_constraint`,
+  `app/verification.py:175-210`) re-runs `check_allergy_conflict` in code
+  regardless of model behavior, so an injected instruction trying to get
+  the model to *omit or downplay* one of the ~27 hardcoded medication names
+  in `_MEDICATION_TERMS` (`app/verification.py:43-49`) is still caught —
+  **but only for those ~27 names**. An injected/hallucinated claim about
+  any medication outside that curated list bypasses the hard-block
+  entirely (`med_candidates` at `app/verification.py:186` filters by
+  `_MEDICATION_TERMS` before the re-check ever runs). This curated-list
+  blind spot is already documented in `verification.py`'s comments as a
+  quality limitation, but it is equally a **security-relevant gap**: it's
+  the exact seam an injected instruction would need to land in to defeat
+  the one control the architecture calls unbypassable.
+- Source-attribution stripping (`_check_source_attribution`,
+  `app/verification.py:150-172`) only inspects the draft response for
+  matches against the same curated vocabulary (`_ALL_TERMS`) or a dose
+  regex. It provides **no defense at all** against an injected instruction
+  that steers the model toward content outside that vocabulary — altered
+  urgency/tone, a fabricated non-clinical recommendation, a social-
+  engineering line ("call this number to verify"), or an instruction to
+  suppress a warning it would otherwise raise. None of that is
+  clinical-term-shaped, so nothing in the verification layer would ever
+  see it.
+- **Zero test coverage exists for this class of attack today.** The single
+  `adversarial` eval case (`evals/cases.py:150-180`,
+  `CASE_ADVERSARIAL_HALLUCINATION`) tests unprompted model hallucination
+  (asking about a medication the patient isn't on) — it does not construct
+  a chart fixture containing an injection payload in a narrative field and
+  check that the model doesn't follow it. This is a real gap in
+  `evals/cases.py` worth closing with a dedicated fixture/case, separate
+  from any code fix.
+
+**Likelihood: Medium** (requires chart-write access somewhere upstream —
+plausible via a compromised/malicious staff account, a patient-facing
+intake form that free-texts into these fields, or shared/demo data
+reused carelessly). **Impact: Medium-High** (bounded by the domain-
+constraint wall for the ~27 known drug names; effectively unbounded for
+everything else a response can say). **Status: Partially mitigated.**
+
+### 4.5 Public, unauthenticated `/chat` and `/ui` — actual severity is PHI exposure, not just cost — **High, Largely mitigated 2026-09-17 (residual gap below)**
+
+`README.md`'s "Known gaps" already documents that the droplet's port 8420
+is public with zero authentication, framed primarily as an **API-cost**
+risk ("anyone who finds the port can trigger real, cost-incurring Anthropic
+API calls"). Given §4.2 and §4.3's *original* state (one shared,
+broad-scope service credential, no per-resident binding), the actual worst
+case was larger than cost: **any unauthenticated internet client can read
+any patient's chart data the service credential can reach**, by supplying
+an arbitrary `patient_id` to `/chat`, or by simply typing a patient UUID
+into the `GET /ui` page (`app/main.py`, added specifically "so there's
+something to click instead of only curl") — no API knowledge required at
+all. `/ui` renders all model/user text via `textContent`, which correctly
+prevents any XSS from attacker-influenced chart content reaching the
+browser DOM — that specific sub-risk was already mitigated — but it did
+nothing about the underlying unauthenticated data-access path.
+
+**What changed:** Phase 1 (`CLAUDE_CODE_BUILD_INSTRUCTIONS.md`, present in
+the working tree, not yet fully committed) added the resident-scoped
+`authorization_code` login this finding's fix implicitly called for.
+`POST /chat` (`app/main.py:424`) now resolves a session from the
+`copilot_session` cookie and returns a plain 401 with no data if one isn't
+present — confirmed live: a bare `curl -X POST /chat` with no cookie gets
+401, not a chart. `GET /ui` shows a "Log in with OpenEMR" gate (calling
+`GET /me`, `app/main.py:412`) instead of the chat form until that login
+completes. The core mechanism this finding described — *zero*
+authentication, service-credential-wide read access to any caller — no
+longer exists.
+
+**Residual gap, not fully closed:** the login is real, but for the current
+grading deployment specifically, the credential behind it (`admin`/`pass`)
+is the same one `README.md` publishes for graders to use, by design. So
+while every `/chat` caller is now a real, authenticated OpenEMR session
+(closing the *unattributed, credential-less* read this finding described),
+anyone who reads the README can still complete that login and reach the
+same data `admin` can reach — which, per §4.3's confirmed cross-provider
+ACL gap, is broader than "their own" patients. This is a materially
+smaller, qualitatively different exposure (a documented, revocable
+credential behind a real OAuth flow, not an anonymous unauthenticated
+port) — but it is not zero, and is worth naming explicitly rather than
+treating "login added" as fully closing this finding.
+
+**Likelihood: Low-Medium now** (was High) — requires knowing/using the
+documented grading credential, not just reaching an open port. **Impact:
+unchanged if exploited** (still real PHI, still broader than the
+credential-holder's "own" patients per the cross-provider gap). **Status:
+Largely mitigated** — the zero-auth mechanism this finding named is gone;
+the residual risk is now a credential-management question (rotate/scope
+the grading credential post-grading), not an architectural one.
+
+### 4.6 PHI in logs and self-hosted telemetry — **Medium, Partially mitigated**
+
+Full tool outputs (complete patient snapshots — conditions, medications,
+allergies, demographics) are sent to Langfuse
+(`app/observability.py:147-152`, `handle.langfuse_span.update(output=...)`)
+and turn-level user messages/final responses are written to stdout as JSON
+(`app/observability.py:34-56`, `finish_turn` logging `final_response` in
+full). Self-hosting Langfuse (rather than a third-party SaaS tier) is a
+real, deliberate mitigation already made (`ARCHITECTURE.md` §7.4) — this
+keeps PHI off an external vendor's servers. What's not addressed anywhere
+in the docs or code: log/trace retention policy, access control on the
+Langfuse instance itself or on stdout/container logs, or redaction of PHI
+fields before they're written. Combined with §4.2, this also means PHI for
+patients outside a resident's legitimate request can end up persisted in
+Langfuse even when never shown to that resident.
+
+**Status: Partially mitigated** (self-hosted, not third-party SaaS) /
+**Open** (no retention/access-control/redaction policy documented).
+
+### 4.7 Conversation ownership — no binding between `conversation_id` and any identity — **Medium, Open**
+
+`POST /chat` accepts a client-supplied `conversation_id`
+(`app/main.py:98`) and looks it up in a process-wide dict with no
+ownership check (`app/main.py:332`: `_conversations.get(conversation_id,
+_ConversationState())`). Whoever supplies a given UUID can continue that
+conversation, including its `accumulated_tool_records` — real PHI fetched
+in earlier turns (`app/main.py:85-89`'s own comment: "must travel with the
+conversation"). UUIDv4 entropy makes blind guessing impractical, so the
+practical exposure today is limited to **leaked** IDs (browser history,
+proxy/access logs, a shared screen, referrer headers) rather than
+enumeration — but there is no defense-in-depth here at all: possession of
+the string is 100% of the authorization model. This matters more, not
+less, once §4.3's per-resident auth lands, since a real authenticated
+session still wouldn't be cryptographically tied to the conversations it's
+allowed to resume unless that binding is added explicitly.
+
+Related, minor: `_conversations` (`app/main.py:92`) never evicts entries —
+every distinct `conversation_id` (including a fresh UUID generated
+server-side for every request that omits one) grows the dict for the
+process lifetime. Given the public port, this is an unauthenticated,
+unbounded memory-growth vector (**Low-Medium likelihood, Medium impact,
+Open** — availability, not confidentiality).
+
+**Status: Open.**
+
+---
+
+## 5. Supply chain and cryptography check
+
+### 5.1 `requirements.txt` currency
+
+| Package | Pinned in `requirements.txt` | Actually installed (`.venv`) |
+|---|---|---|
+| httpx | `>=0.27` | 0.28.1 |
+| pydantic | `>=2.6` | 2.13.5 |
+| anthropic | `>=0.40` | 1.6.0 |
+| fastapi | `>=0.110` | 0.141.1 |
+| uvicorn[standard] | `>=0.29` | 0.53.0 |
+| langfuse | `>=2.50` | 4.15.3 |
+| python-dotenv | `>=1.0` | 1.2.3 |
+| locust | `>=2.46` | 2.46.5 |
+
+Every installed version satisfies its stated floor — nothing is stale in
+the sense of "older than the requirement." The finding is the opposite:
+**every constraint is an unpinned lower bound with no lockfile
+(`pip freeze`/`pip-compile` output) and no hash pinning.** A fresh
+`pip install -r requirements.txt` today, or on any future rebuild, resolves
+to whatever the latest matching release is at install time — currently
+`anthropic` 1.6.0 against a stated floor of `0.40`, a large jump that
+happens to work today but is not reproducible or diffable in CI. This also
+means a future compromised or yanked release on PyPI would be picked up
+silently on next install with nothing to flag the version jump.
+
+One artifact worth noting for completeness, not a finding: `httpx2`
+(2.13.0) appears in the installed environment but not in
+`requirements.txt` — verified as a legitimate transitive dependency of
+`anthropic==1.6.0` (`pip show httpx2` lists `Required-by: anthropic`,
+published under the same `pydantic`/Tom Christie GitHub org as `httpx`),
+not an unexplained or typosquat package.
+
+**Status: Open** (reproducibility/supply-chain-drift risk — recommend a
+lockfile with hashes before this goes anywhere near production, independent
+of any current version being "wrong").
+
+### 5.2 Custom cryptography check — `auth.py`, `verification.py`
+
+Grepped both files (and the rest of `app/`) for hand-rolled crypto:
+hashing, HMAC, JWT handling, random-number generation for security
+purposes, encoding used as if it were encryption. **None found in either
+file.**
+
+- `app/auth.py` implements OAuth2 password/refresh-token grants entirely
+  by POSTing form data via `httpx` and reading the JSON response
+  (`app/auth.py:57-94`) — no signature verification, token parsing, or
+  cryptographic operation is performed client-side at all; OpenEMR's OAuth
+  server is the sole holder of any crypto logic. Token caching uses a
+  plain `threading.Lock` and a monotonic-clock expiry check
+  (`app/auth.py:39-47`) — standard, not cryptographic.
+- `app/verification.py` does no cryptography of any kind — it's entirely
+  string/regex matching against a curated vocabulary (§4.4 above).
+
+**Status: Not applicable / no finding.** Both files correctly delegate all
+cryptographic concerns to the OAuth provider and TLS transport
+(`verify_tls`, `app/config.py:37,80`, correctly defaulting to `true`, with
+the local-dev-only `false` override clearly scoped and documented in
+`.env.example`).
+
+---
+
+## 6. Summary table
+
+| # | Threat | Likelihood | Impact | Status |
+|---|---|---|---|---|
+| 4.1 | Domain-constraint wall silently disabled + falsely reported "passed" when `patient_id` omitted | High | Critical | **Fixed**, commit `ff18c21` |
+| 4.2 | Agent-mediated IDOR: tool execution not bound to declared active patient | Medium-High | High | **Fixed**, commit `ff18c21` — NOT closed by 4.3's auth migration (orthogonal), see 4.3 |
+| 4.3 | Resident-scoped auth (landed, uncommitted) | — | — | **Present, partially reviewed** — cross-provider role-scope gap confirmed real/unfixed; session/conversation binding still open |
+| 4.4 | Indirect prompt injection via uncoded/free-text chart fields | Medium | Medium-High | **Partially mitigated** |
+| 4.4a | Domain-constraint hard-block only covers ~27 hardcoded drug names | Medium | High | **Partially mitigated / Open** |
+| 4.5 | Public unauthenticated `/chat` + `/ui` — real risk is PHI exposure, not just cost | Low-Medium (was High) | High if exploited | **Largely mitigated** — real login now required; residual risk is the documented grading credential, not zero-auth |
+| 4.6 | PHI in logs / self-hosted Langfuse, no retention/redaction policy | — | Medium | **Partially mitigated** |
+| 4.7 | No `conversation_id` ↔ identity binding | Low-Medium | Medium | **Open** |
+| 4.7a | Unbounded in-memory conversation store (availability) | Medium | Medium | **Open** |
+| 5.1 | `requirements.txt` unpinned, no lockfile | Low-Medium | Low-Medium | **Open** |
+| 5.2 | Custom cryptography in `auth.py`/`verification.py` | — | — | **Not applicable — none found** |
+| — | FHIR search params via `httpx` (auto-encoded, no injection) | — | — | **Mitigated** |
+| — | `/ui` renders via `textContent`, not `innerHTML` (no XSS) | — | — | **Mitigated** |
+| — | TLS verification defaults on; dev bypass scoped and documented | — | — | **Mitigated** |
+| — | Secrets (`.env`, `docker/.env.langfuse`) correctly gitignored | — | — | **Mitigated** |
+
+## 7. Not covered by this pass
+
+- No dynamic testing was performed (no live requests sent against a running
+  instance) — every finding above is from static code/doc review. §4.1 and
+  §4.2 in particular should be confirmed by an actual `/chat` call before
+  being treated as fully proven.
+- The four not-yet-built tools (`get_recent_encounters`,
+  `get_recent_observations`, `compare_signout_to_chart`,
+  `summarize_shift_events`) don't exist in this codebase yet and aren't
+  modeled here.
+- The planned OpenEMR-embedded chart module (`ARCHITECTURE.md` §1.1) also
+  doesn't exist yet; this model only covers the standalone service.
