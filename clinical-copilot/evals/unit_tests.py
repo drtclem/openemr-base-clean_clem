@@ -47,7 +47,7 @@ def _contains_all(text: str, terms: list[str]) -> bool:
 
 
 def test_get_patient_snapshot_pid1(fhir: FhirClient) -> tuple[bool, str]:
-    result = get_patient_snapshot(fhir, {"patient_id": f.PID1_ALICE})
+    result = get_patient_snapshot(fhir, {"patient_id": f.PID1_ALICE}, [])
     if not isinstance(result, GetPatientSnapshotOutput):
         return False, f"expected a snapshot, got a tool failure: {result}"
     facts = GOLDEN_FACTS["pid1_alice"]
@@ -61,7 +61,7 @@ def test_get_patient_snapshot_pid1(fhir: FhirClient) -> tuple[bool, str]:
 
 
 def test_get_patient_snapshot_pid2(fhir: FhirClient) -> tuple[bool, str]:
-    result = get_patient_snapshot(fhir, {"patient_id": f.PID2_BOB})
+    result = get_patient_snapshot(fhir, {"patient_id": f.PID2_BOB}, [])
     if not isinstance(result, GetPatientSnapshotOutput):
         return False, f"expected a snapshot, got a tool failure: {result}"
     facts = GOLDEN_FACTS["pid2_bob"]
@@ -78,7 +78,7 @@ def test_get_patient_snapshot_pid2(fhir: FhirClient) -> tuple[bool, str]:
 
 
 def test_check_allergy_conflict_positive(fhir: FhirClient) -> tuple[bool, str]:
-    result = check_allergy_conflict(fhir, {"patient_id": f.PID1_ALICE, "medication_name": "penicillin"})
+    result = check_allergy_conflict(fhir, {"patient_id": f.PID1_ALICE, "medication_name": "penicillin"}, [])
     if not isinstance(result, CheckAllergyConflictOutput):
         return False, f"expected a conflict result, got a tool failure: {result}"
     if not result.conflict_found:
@@ -87,7 +87,7 @@ def test_check_allergy_conflict_positive(fhir: FhirClient) -> tuple[bool, str]:
 
 
 def test_check_allergy_conflict_negative(fhir: FhirClient) -> tuple[bool, str]:
-    result = check_allergy_conflict(fhir, {"patient_id": f.PID1_ALICE, "medication_name": "metformin"})
+    result = check_allergy_conflict(fhir, {"patient_id": f.PID1_ALICE, "medication_name": "metformin"}, [])
     if not isinstance(result, CheckAllergyConflictOutput):
         return False, f"expected a conflict result, got a tool failure: {result}"
     if result.conflict_found:
@@ -101,7 +101,7 @@ def test_check_allergy_conflict_cross_reactive(fhir: FhirClient) -> tuple[bool, 
     curated 'penicillins' class -- even though "amoxicillin" never appears
     in the allergy text itself, so this can only pass via the cross-
     reactivity table, not the pre-existing direct/substring match."""
-    result = check_allergy_conflict(fhir, {"patient_id": f.PID1_ALICE, "medication_name": "amoxicillin"})
+    result = check_allergy_conflict(fhir, {"patient_id": f.PID1_ALICE, "medication_name": "amoxicillin"}, [])
     if not isinstance(result, CheckAllergyConflictOutput):
         return False, f"expected a conflict result, got a tool failure: {result}"
     if not result.conflict_found:
@@ -116,7 +116,7 @@ def test_check_allergy_conflict_cross_reactive_scoped_to_curated_classes(fhir: F
     drug-class knowledge base -- a medication in no curated class, and not
     a direct/substring match, must still come back as no conflict rather
     than the table silently over-firing."""
-    result = check_allergy_conflict(fhir, {"patient_id": f.PID1_ALICE, "medication_name": "metformin"})
+    result = check_allergy_conflict(fhir, {"patient_id": f.PID1_ALICE, "medication_name": "metformin"}, [])
     if not isinstance(result, CheckAllergyConflictOutput):
         return False, f"expected a conflict result, got a tool failure: {result}"
     if result.conflict_found:
@@ -130,7 +130,7 @@ def test_check_allergy_conflict_cross_reactive_scoped_to_curated_classes(fhir: F
 
 
 def test_verification_strips_ungrounded_claim(fhir: FhirClient) -> tuple[bool, str]:
-    snapshot = get_patient_snapshot(fhir, {"patient_id": f.PID1_ALICE})
+    snapshot = get_patient_snapshot(fhir, {"patient_id": f.PID1_ALICE}, [])
     if not isinstance(snapshot, GetPatientSnapshotOutput):
         return False, f"setup failed: couldn't fetch pid1 snapshot ({snapshot})"
     record = ToolCallRecord(tool_name="get_patient_snapshot", patient_id=f.PID1_ALICE, output=snapshot)
@@ -151,7 +151,7 @@ def test_verification_strips_ungrounded_claim(fhir: FhirClient) -> tuple[bool, s
 
 
 def test_verification_passes_grounded_claim(fhir: FhirClient) -> tuple[bool, str]:
-    snapshot = get_patient_snapshot(fhir, {"patient_id": f.PID1_ALICE})
+    snapshot = get_patient_snapshot(fhir, {"patient_id": f.PID1_ALICE}, [])
     if not isinstance(snapshot, GetPatientSnapshotOutput):
         return False, f"setup failed: couldn't fetch pid1 snapshot ({snapshot})"
     record = ToolCallRecord(tool_name="get_patient_snapshot", patient_id=f.PID1_ALICE, output=snapshot)
@@ -235,7 +235,7 @@ def test_domain_constraint_backstop_survives_missing_patient_id(fhir: FhirClient
     (`app/verification.py::_effective_domain_check_patient_id`), rather than
     skipping the check outright.
     """
-    snapshot = get_patient_snapshot(fhir, {"patient_id": f.PID1_ALICE})
+    snapshot = get_patient_snapshot(fhir, {"patient_id": f.PID1_ALICE}, [])
     if not isinstance(snapshot, GetPatientSnapshotOutput):
         return False, f"setup failed: couldn't fetch pid1 snapshot ({snapshot})"
     record = ToolCallRecord(tool_name="get_patient_snapshot", patient_id=f.PID1_ALICE, output=snapshot)
@@ -303,7 +303,7 @@ def test_shift_summary_reports_nothing_gathered_yet(fhir: FhirClient) -> tuple[b
     exercised against pid3's real empty chart; this test is deliberately
     the other honest-failure condition, not a duplicate of it.
     """
-    result = summarize_shift_events([], {"patient_id": f.PID1_ALICE})
+    result = summarize_shift_events(fhir, {"patient_id": f.PID1_ALICE}, [])
     if not isinstance(result, SummarizeShiftEventsOutput):
         return False, f"expected a SummarizeShiftEventsOutput, got: {result!r}"
     if result.data_gathered is not False:
@@ -323,7 +323,7 @@ def test_shift_summary_reports_nothing_gathered_yet(fhir: FhirClient) -> tuple[b
             duplicate_warnings=[], partial_failures=[],
         ),
     )
-    scoped_result = summarize_shift_events([other_patient_record], {"patient_id": f.PID1_ALICE})
+    scoped_result = summarize_shift_events(fhir, {"patient_id": f.PID1_ALICE}, [other_patient_record])
     if scoped_result.data_gathered is not False:
         return False, "a different patient's gathered data incorrectly counted as 'gathered' for this patient"
 

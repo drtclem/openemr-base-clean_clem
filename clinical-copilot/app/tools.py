@@ -3,15 +3,22 @@
 Each maps directly to a USERS.md use case and a row of ARCHITECTURE.md's
 Section 2 table:
 
-- get_patient_snapshot    -> Patient, Condition, AllergyIntolerance, MedicationRequest
-- check_allergy_conflict  -> AllergyIntolerance vs. a supplied medication name
-- get_recent_encounters   -> Encounter (Phase 6, sensitivity-filtered -- app/sensitivity.py)
-- get_recent_observations -> Observation (UC2, NOT sensitivity-filtered -- see its own
+- get_patient_snapshot     -> Patient, Condition, AllergyIntolerance, MedicationRequest
+- check_allergy_conflict   -> AllergyIntolerance vs. a supplied medication name
+- get_recent_encounters    -> Encounter (Phase 6, sensitivity-filtered -- app/sensitivity.py)
+- get_recent_observations  -> Observation (UC2, NOT sensitivity-filtered -- see its own
   docstring below for why that compensating control doesn't apply here)
-- summarize_shift_events  -> UC4, different in kind from the other four: no FHIR call,
-  no `fhir` parameter, takes this conversation's already-accumulated ToolCallRecords
-  instead -- see its own docstring below, and ClinicalCopilotAgent._call_tool's
-  special-case dispatch for it (app/agent.py).
+- summarize_shift_events   -> UC4, deterministic aggregation only, no FHIR call --
+  synthesizes purely from this conversation's already-accumulated ToolCallRecords.
+- compare_signout_to_chart -> UC2, does a fresh, unconditional fetch (Patient,
+  Condition, MedicationRequest, AllergyIntolerance, Encounter, Observation) and
+  structurally diffs it against turn_records -- never parses or trusts the
+  sign-out's own text, see its own docstring below for why.
+
+Every tool shares the same impl(fhir, tool_input, turn_records) dispatch
+signature (ClinicalCopilotAgent._call_tool, app/agent.py) even though most
+ignore one parameter or the other -- unified once a second tool needed
+turn_records, rather than growing per-tool special cases in the dispatcher.
 
 Error handling follows ARCHITECTURE.md Section 2's hard rule: a tool call
 that fails returns a structured ToolFailure the agent must surface directly,
@@ -27,8 +34,11 @@ from app.clinical_reference import cross_reactive_class
 from app.fhir_client import FhirClient, FhirRequestError, bundle_entries
 from app.schemas import (
     AllergyFact,
+    ChartDiscrepancy,
     CheckAllergyConflictInput,
     CheckAllergyConflictOutput,
+    CompareSignoutToChartInput,
+    CompareSignoutToChartOutput,
     ConditionFact,
     DuplicatePatientWarning,
     EncounterFact,
@@ -124,7 +134,15 @@ def _find_duplicates(fhir: FhirClient, patient: dict) -> list[DuplicatePatientWa
     return matches
 
 
-def get_patient_snapshot(fhir: FhirClient, raw_input: dict) -> GetPatientSnapshotOutput | ToolFailure:
+def get_patient_snapshot(
+    fhir: FhirClient, raw_input: dict, turn_records: list[ToolCallRecord]
+) -> GetPatientSnapshotOutput | ToolFailure:
+    # turn_records: unused -- accepted only for the uniform impl(fhir,
+    # tool_input, turn_records) dispatch signature all five tools now
+    # share (app/agent.py's _call_tool). See summarize_shift_events'
+    # docstring below for why the signature was unified rather than kept
+    # special-cased once a second tool (compare_signout_to_chart) needed
+    # turn_records too.
     try:
         params = GetPatientSnapshotInput.model_validate(raw_input)
     except Exception:
@@ -231,7 +249,10 @@ def get_patient_snapshot(fhir: FhirClient, raw_input: dict) -> GetPatientSnapsho
     )
 
 
-def check_allergy_conflict(fhir: FhirClient, raw_input: dict) -> CheckAllergyConflictOutput | ToolFailure:
+def check_allergy_conflict(
+    fhir: FhirClient, raw_input: dict, turn_records: list[ToolCallRecord]
+) -> CheckAllergyConflictOutput | ToolFailure:
+    # turn_records: unused, see get_patient_snapshot's comment above.
     try:
         params = CheckAllergyConflictInput.model_validate(raw_input)
     except Exception:
@@ -314,7 +335,10 @@ def check_allergy_conflict(fhir: FhirClient, raw_input: dict) -> CheckAllergyCon
 _RESIDENT_ROLE: Role = "clin"
 
 
-def get_recent_encounters(fhir: FhirClient, raw_input: dict) -> GetRecentEncountersOutput | ToolFailure:
+def get_recent_encounters(
+    fhir: FhirClient, raw_input: dict, turn_records: list[ToolCallRecord]
+) -> GetRecentEncountersOutput | ToolFailure:
+    # turn_records: unused, see get_patient_snapshot's comment above.
     try:
         params = GetRecentEncountersInput.model_validate(raw_input)
     except Exception:
@@ -422,12 +446,16 @@ def _observation_value_text(res: dict) -> str | None:
     return ", ".join(parts) if parts else None
 
 
-def get_recent_observations(fhir: FhirClient, raw_input: dict) -> GetRecentObservationsOutput | ToolFailure:
+def get_recent_observations(
+    fhir: FhirClient, raw_input: dict, turn_records: list[ToolCallRecord]
+) -> GetRecentObservationsOutput | ToolFailure:
     """UC2 (USERS.md): "what changed" for labs/vitals -- the same sign-out-
     verification role get_recent_encounters plays for visit history.
     Deliberately NOT run through app/sensitivity.py's compensating filter;
     see GetRecentObservationsOutput's docstring in schemas.py for why that
     control (scoped specifically to Encounter data) doesn't apply here.
+
+    turn_records: unused, see get_patient_snapshot's comment above.
     """
     try:
         params = GetRecentObservationsInput.model_validate(raw_input)
@@ -465,17 +493,21 @@ def get_recent_observations(fhir: FhirClient, raw_input: dict) -> GetRecentObser
 
 
 def summarize_shift_events(
-    turn_records: list[ToolCallRecord], raw_input: dict
+    fhir: FhirClient, raw_input: dict, turn_records: list[ToolCallRecord]
 ) -> SummarizeShiftEventsOutput | ToolFailure:
     """UC4 (USERS.md): synthesizes a shift-handoff summary purely from facts
     already gathered THIS conversation (turn_records -- accumulated across
     both this turn's own tool-call rounds and any earlier turns, see
     ClinicalCopilotAgent.run_turn's prior_tool_records docstring in
-    app/agent.py). Makes NO new FHIR call and takes NO fhir client, unlike
-    every other tool in this module -- dispatched through a special case in
-    ClinicalCopilotAgent._call_tool, not the uniform impl(fhir, tool_input)
-    pattern the other four share; see that special case's own comment for
-    why (app/agent.py).
+    app/agent.py). Makes NO new FHIR call -- `fhir` is accepted, unused, only
+    for the uniform impl(fhir, tool_input, turn_records) dispatch signature
+    every tool now shares (ClinicalCopilotAgent._call_tool, app/agent.py).
+
+    That signature was originally special-cased just for this tool (the only
+    one needing turn_records at the time); unified to a single shape once
+    compare_signout_to_chart needed BOTH fhir (it does a fresh, unconditional
+    fetch -- see its own docstring) and turn_records, rather than growing a
+    second special case in _call_tool for every new shape a tool might need.
 
     Purely deterministic aggregation, no generation: this function never
     calls the model. The actual narrative synthesis into shift-summary
@@ -555,3 +587,166 @@ def summarize_shift_events(
             deduped.append(event)
 
     return SummarizeShiftEventsOutput(patient_id=params.patient_id, events=deduped, data_gathered=True)
+
+
+def _diff_by_source_resource(old_items: list, new_items: list, category: str, text_fn=None) -> list[ChartDiscrepancy]:
+    """Set-diffs two lists of Fact-shaped objects (each with .source_resource,
+    identified per resource type by FHIR id) by that id. Returns a
+    ChartDiscrepancy for every new_items entry whose id wasn't present in
+    old_items -- a purely structural comparison (presence/absence by id),
+    no interpretation of what a new entry clinically means."""
+    text_fn = text_fn or (lambda item: item.text)
+    old_ids = {item.source_resource for item in old_items}
+    return [
+        ChartDiscrepancy(category=category, text=f"{text_fn(item)} (new since last check)", source_resource=item.source_resource)
+        for item in new_items
+        if item.source_resource not in old_ids
+    ]
+
+
+def _diff_medication_status(old_meds: list[MedicationFact], new_meds: list[MedicationFact]) -> list[ChartDiscrepancy]:
+    """Like _diff_by_source_resource, but also flags a status change (e.g.
+    active -> stopped) for a medication present in both -- the one place a
+    same-id comparison matters more than presence/absence for this tool's
+    purpose (a sign-out claim about an active medication can go stale by
+    the medication being discontinued, not just by a new one appearing)."""
+    old_by_id = {m.source_resource: m for m in old_meds}
+    discrepancies: list[ChartDiscrepancy] = []
+    for m in new_meds:
+        old = old_by_id.get(m.source_resource)
+        if old is None:
+            discrepancies.append(
+                ChartDiscrepancy(category="medication", text=f"{m.text} (new since last check)", source_resource=m.source_resource)
+            )
+        elif old.status != m.status:
+            discrepancies.append(
+                ChartDiscrepancy(
+                    category="medication",
+                    text=f"{m.text}: {old.status} -> {m.status}",
+                    source_resource=m.source_resource,
+                )
+            )
+    return discrepancies
+
+
+def compare_signout_to_chart(
+    fhir: FhirClient, raw_input: dict, turn_records: list[ToolCallRecord]
+) -> CompareSignoutToChartOutput | ToolFailure:
+    """UC2 (USERS.md): "has something changed since sign-out was written" --
+    verifying a conditional sign-out instruction ("if potassium is high,
+    give X") against the real, current chart.
+
+    Deliberately does NOT take the sign-out's own text as input, and does
+    not attempt to parse or semantically compare it. Interpreting free text
+    into a structured claim is inherently a natural-language judgment call;
+    putting that interpretation inside this tool would mean either a
+    second, nested LLM call whose output nothing in this architecture
+    checks (verify_response() only scans the FINAL response text, never an
+    intermediate tool output -- the exact risk named and avoided in
+    summarize_shift_events' design), or a brittle hand-rolled parser that
+    can't handle real sign-out prose. Neither is built here.
+
+    Instead: this function does a FRESH, UNCONDITIONAL re-fetch -- by
+    design, this tool's whole value is guaranteeing freshness, unlike
+    summarize_shift_events, which deliberately reuses already-gathered
+    data -- and structurally diffs it against whatever this conversation
+    already knew (turn_records) for this patient. The sign-out's actual
+    prose never enters this function at all; it stays in the resident's
+    own message, already in the outer model's context. The model connects
+    "sign-out said X" (its own context) to "here's what changed" (this
+    tool's structured diff) in its final drafted response, the same
+    division of labor every other tool uses, so that response still passes
+    through verify_response()'s existing grounding check with no new
+    verification machinery needed.
+
+    baseline_established=False means turn_records had nothing for this
+    patient yet -- this fetch becomes the new baseline, not a confirmed
+    "nothing has changed." What "already knew" means here is itself a
+    named approximation: this system has no record of the actual moment
+    sign-out was written, so "what this conversation already fetched" is
+    the best available proxy for it, not a full solution to comparing
+    against sign-out time specifically.
+
+    Delegates its fresh fetches to get_patient_snapshot/get_recent_
+    encounters/get_recent_observations directly, rather than re-fetching
+    raw FHIR itself -- reuses their tested parsing logic, and inherits
+    get_recent_encounters' compensating sensitivity filter for free in the
+    process (that filter runs inside get_recent_encounters itself, before
+    this function ever sees its output).
+    """
+    try:
+        params = CompareSignoutToChartInput.model_validate(raw_input)
+    except Exception:
+        return ToolFailure(
+            tool="compare_signout_to_chart",
+            reason="I couldn't process that patient reference -- it wasn't a valid patient ID.",
+            detail_code="invalid_input",
+        )
+
+    prior_snapshot = next(
+        (
+            r.output
+            for r in turn_records
+            if r.patient_id == params.patient_id and isinstance(r.output, GetPatientSnapshotOutput)
+        ),
+        None,
+    )
+    prior_encounters = next(
+        (
+            r.output
+            for r in turn_records
+            if r.patient_id == params.patient_id and isinstance(r.output, GetRecentEncountersOutput)
+        ),
+        None,
+    )
+    prior_observations = next(
+        (
+            r.output
+            for r in turn_records
+            if r.patient_id == params.patient_id and isinstance(r.output, GetRecentObservationsOutput)
+        ),
+        None,
+    )
+    baseline_established = any([prior_snapshot, prior_encounters, prior_observations])
+
+    fresh_snapshot = get_patient_snapshot(fhir, {"patient_id": params.patient_id}, turn_records)
+    fresh_encounters = get_recent_encounters(fhir, {"patient_id": params.patient_id}, turn_records)
+    fresh_observations = get_recent_observations(fhir, {"patient_id": params.patient_id}, turn_records)
+
+    partial_failures: list[str] = []
+    discrepancies: list[ChartDiscrepancy] = []
+
+    if isinstance(fresh_snapshot, ToolFailure):
+        partial_failures.append(f"snapshot: {fresh_snapshot.detail_code}")
+        fresh_snapshot = None
+    elif prior_snapshot:
+        discrepancies += _diff_by_source_resource(prior_snapshot.conditions, fresh_snapshot.conditions, "condition")
+        discrepancies += _diff_medication_status(prior_snapshot.medications, fresh_snapshot.medications)
+        discrepancies += _diff_by_source_resource(prior_snapshot.allergies, fresh_snapshot.allergies, "allergy")
+
+    if isinstance(fresh_encounters, ToolFailure):
+        partial_failures.append(f"encounters: {fresh_encounters.detail_code}")
+        fresh_encounters = None
+    elif prior_encounters:
+        discrepancies += _diff_by_source_resource(prior_encounters.encounters, fresh_encounters.encounters, "encounter")
+
+    if isinstance(fresh_observations, ToolFailure):
+        partial_failures.append(f"observations: {fresh_observations.detail_code}")
+        fresh_observations = None
+    elif prior_observations:
+        discrepancies += _diff_by_source_resource(
+            prior_observations.observations,
+            fresh_observations.observations,
+            "observation",
+            text_fn=lambda o: f"{o.text}: {o.value}" if o.value else o.text,
+        )
+
+    return CompareSignoutToChartOutput(
+        patient_id=params.patient_id,
+        baseline_established=baseline_established,
+        discrepancies=discrepancies,
+        current_snapshot=fresh_snapshot,
+        current_encounters=fresh_encounters,
+        current_observations=fresh_observations,
+        partial_failures=partial_failures,
+    )

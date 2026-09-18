@@ -10,7 +10,7 @@
   (`get_patient_snapshot`, `check_allergy_conflict`) and `verification.py`'s
   stripping logic, independent of whether the model behaves well on any
   given day. Free and instant, so there's no reason not to run it constantly.
-- **`evals/cases.py`** (the 16 cases below) -- exercises the agent's actual
+- **`evals/cases.py`** (the 18 cases below) -- exercises the agent's actual
   LLM behavior, real Anthropic calls, costs real spend per run. Triggered
   manually / before deploys (`python3 -m evals.run_evals`), not on every
   commit.
@@ -24,7 +24,7 @@ verification change).
 
 ## Golden Set vs. Behavioral Coverage
 
-The current 16 LLM-based cases in `evals/cases.py` are, by definition, a
+The current 18 LLM-based cases in `evals/cases.py` are, by definition, a
 **Golden Set**: small, every case expected to pass, correctness-focused --
 each one pins down a specific known fact, invariant, or prior finding, and a
 failure means something genuinely broke. This is deliberately not yet
@@ -178,7 +178,7 @@ worthwhile, following the same process (read real traces, name failure
 modes in plain language, then cluster), not by inventing more cases from a
 checklist.
 
-**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 16 cases
+**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 18 cases
 as a persisted Langfuse Dataset (one item per case, keyed by case name for
 idempotent re-creation) so pass-rate history becomes a visible trend across
 runs in the Langfuse UI (Datasets/Experiments in the sidebar), not just a
@@ -225,6 +225,8 @@ is a synthesis/formatting pass over what's already there, not new analysis.
 | `observation_value_reaches_response_accurately` | invariant | 2 (verify a sign-out instruction against the current chart) | UC2 (USERS.md): a real, current observation value must reach the resident accurately -- a conditional sign-out instruction ("if potassium is high, give X") is only checkable against a correctly-reported value. Uses a controlled fixture, not live data (see the case's own docstring); note that "potassium" isn't in `verification.py`'s scannable vocabulary, so this tests the model's own accuracy, not the structural safety net -- see Known Scenario Gaps below |
 | `shift_summary_empty_honest_report` | boundary | 4 (end-of-shift summary handoff -- `summarize_shift_events` is how the agent synthesizes what it already gathered into a handoff) | UC4 (USERS.md): a shift with zero notable events must produce an honest "nothing notable" rather than fabricated filler. Exercised against pid3's real, live empty chart, not a stub. |
 | `shift_summary_no_fabrication` | invariant | 4 (end-of-shift summary handoff) | UC4 (USERS.md): a shift-handoff summary must never state anything not present in the source data it's summarizing from -- baits with a plausible-but-absent overnight event (ICU transfer, code status change) against a fully-known controlled fixture and confirms it never appears. |
+| `signout_check_no_baseline` | boundary | 2 (verify a sign-out instruction against the current chart) | UC2 (USERS.md): a sign-out check as the first thing in a conversation has nothing gathered yet to diff against -- `compare_signout_to_chart`'s `baseline_established=False` path. Deliberately uses a CHANGE-shaped claim ("nothing has changed overnight"), not a present-tense fact claim -- see the case's own docstring in `evals/cases.py` for why that distinction mattered live. |
+| `signout_discrepancy_surfaced` | invariant | 2 (verify a sign-out instruction against the current chart) | UC2 (USERS.md): `compare_signout_to_chart` must actually surface a real discrepancy when one exists, not just handle the clean cases. A stateful fixture (call-count based, not multi-turn) lets the model's own `get_patient_snapshot` establish a baseline and the tool's internal re-fetch see a genuine new condition. |
 
 USERS.md use-case mapping note: where a case's `guards_against` text doesn't
 name a use case explicitly, the mapping above follows ARCHITECTURE.md
@@ -238,10 +240,12 @@ same use cases as `get_recent_encounters`, for the same reason but for
 labs/vitals rather than visit history; `summarize_shift_events` -> **use
 case 4 specifically**, "end-of-shift summary handoff back to the primary
 day team" -- the one tool that exists purely for that use case, not a
-byproduct mapping the way the other three are) plus the case's own message
-content. Use case 4 previously had no case at all here (USERS.md itself
-flags it as lower-priority, build-only-if-time-allows) -- now covered by
-the two `shift_summary_*` cases above. `oauth_scope_enforcement_denied` is
+byproduct mapping the way the other three are; `compare_signout_to_chart`
+-> **use case 2 specifically**, the tool this use case's own name in
+ARCHITECTURE.md's Section 2 table describes most directly) plus the case's
+own message content. Use case 4 previously had no case at all here (USERS.md
+itself flags it as lower-priority, build-only-if-time-allows) -- now covered
+by the two `shift_summary_*` cases above. `oauth_scope_enforcement_denied` is
 the one exception to this mapping scheme entirely: it's an auth-layer
 invariant (Phase 1,
 `CLAUDE_CODE_BUILD_INSTRUCTIONS.md`), not a clinical use case, so it has no
@@ -443,6 +447,93 @@ silently absent:
   synthesize it yourself directly, even if you could," verified against
   both new cases afterward; response quality and clinical content were
   unaffected by the added tool-call round.
+- **NEW, 2026-09-18: `compare_signout_to_chart` (UC2), the sixth and last
+  planned tool -- built after a design-review pass, same shape as the
+  auth/prompt-injection review gates.** Deliberately does NOT take the
+  sign-out's own text as a parameter and does not attempt to parse or
+  semantically compare it -- investigated first: interpreting free text
+  into a structured claim is a natural-language judgment call, and putting
+  that inside the tool would mean either a second, nested LLM call whose
+  output `verify_response()` never checks (the exact risk named and
+  avoided in `summarize_shift_events`' design), or a brittle hand-rolled
+  parser. Instead it does a fresh, unconditional re-fetch (unlike
+  `summarize_shift_events`, which deliberately reuses already-gathered
+  data -- this tool's whole value is freshness) and structurally diffs it
+  against whatever `turn_records` already knew for this patient. The
+  sign-out's prose never enters the tool; the outer model connects "sign-
+  out said X" (its own context) to "here's what changed" (the tool's
+  structured diff) in its final response, same division of labor as every
+  other tool, so no new verification machinery was needed.
+
+  **Signature unification, reconsidering an earlier decision explicitly**:
+  this tool needs both `fhir` (fresh fetch) and `turn_records` (diff
+  baseline) -- a third distinct calling shape after "fhir-only" (four
+  tools) and "turn_records-only" (`summarize_shift_events`, previously
+  special-cased in `_call_tool` since it was the only exception). Rather
+  than adding a second special case, every tool now shares one
+  `impl(fhir, tool_input, turn_records)` signature
+  (`ClinicalCopilotAgent._call_tool`, `app/agent.py`); the four tools that
+  don't need `turn_records` just ignore it. Commented in-code, both at the
+  dispatcher and on each tool, explaining why the earlier per-tool
+  special-casing was reconsidered rather than left to grow indefinitely.
+
+  **The recurring `_ALL_TERMS`/`_grounded_vocabulary()` gap -- partial
+  structural fix, not another one-off patch.** `_DOSE_RE` already proved a
+  structural (shape-based, not enumerated) candidate-detection pattern
+  works for medication doses; extended the same principle with
+  `_LAB_VALUE_RE` (`app/verification.py`) for lab/vital-shaped `number +
+  unit` values (mEq/L, mg/dL, mmHg, °C, ...). A fabricated lab value is
+  now a grounding candidate without "potassium" or any lab name ever
+  needing to join a fixed list -- closes the numeric half of the gap for
+  good, retroactively covering `get_recent_observations` too. **The
+  name-shaped half (a fabricated condition/encounter name) has no numeric
+  shape to match on and has no cheap structural fix** -- explicitly not
+  attempted here; the accepted approach for that half remains incrementally
+  expanding `_ALL_TERMS`, per that module's own existing comment. Caught
+  and fixed live during this build: the new regex's own candidate
+  detection initially broke grounding for a real, tool-sourced value
+  ("38.9°C" from the model vs. "38.9 C" as stored) purely on cosmetic
+  formatting (spacing, the degree symbol) -- `_is_grounded()` now
+  normalizes both sides before giving up, rather than stripping a true
+  fact over formatting.
+
+  **A new, distinct injection-channel finding, not folded into this
+  build's own code changes: `THREAT_MODEL.md` 4.8.** Investigated first,
+  per the design review: the sign-out text this tool's whole purpose
+  revolves around is resident-pasted free text with no structural boundary
+  at all (`POST /chat`'s `message` field is one flat string) -- a different
+  channel from 4.4's tool-retrieved data, higher likelihood (pasting
+  sign-out is UC2's designed, routine usage, not a compromised-write edge
+  case). A `SYSTEM_PROMPT` mitigation was added as part of this build
+  (explicit: sign-out text is an unverified claim to check, never an
+  instruction); the structural fix (a dedicated, wrapped input field) is
+  named as future work, not built, and no eval case exists yet for the
+  injection scenario specifically -- see 4.8 for the full writeup.
+
+  **Two Golden Set cases, both requiring a live-testing correction before
+  landing** (documented in each case's own docstring in `evals/cases.py`):
+  `signout_check_no_baseline`'s first message design (asking about a lab
+  value absent from this dev dataset) confounded "no baseline this
+  conversation" with "no data exists at all" -- fixed by asking about a
+  CHANGE-shaped claim instead, the only claim shape that actually requires
+  a baseline to verify. Its check also initially blocklisted "false
+  confirmation" phrases and failed a fully honest response that used one
+  of them inside a quoted hypothetical while explaining a duplicate-record
+  confound -- fixed by dropping the blocklist and requiring only a clear
+  positive expression of honest non-confirmation. `signout_discrepancy_
+  surfaced` uses a stateful fixture (call-count based) rather than a
+  multi-turn `EvalCase` (which the framework doesn't support) to let the
+  model's own `get_patient_snapshot` establish a real baseline and the
+  tool's internal re-fetch see a genuine change, within one message.
+
+  **Also caught and fixed live during the same full-suite run, unrelated
+  to this tool's own code**: `ambiguous_query_unspecified_medication`
+  (pre-existing, in the Golden Set since Early Submission) failed on a
+  correct clarification response ("Please tell me the specific medication
+  name you want to give") that didn't match any of its original 12-phrase
+  cue list verbatim -- same keyword-brittleness class as tonight's earlier
+  `behavioral_coverage.py` audit, this time caught blocking the Golden
+  Set's own gate. Broadened, verified against the exact failing transcript.
 
 ## Unit-tier invariant checks (`evals/unit_tests.py`)
 

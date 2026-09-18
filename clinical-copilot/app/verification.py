@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from app.fhir_client import FhirClient
 from app.schemas import (
     CheckAllergyConflictOutput,
+    CompareSignoutToChartOutput,
     GetPatientSnapshotOutput,
     GetRecentEncountersOutput,
     GetRecentObservationsOutput,
@@ -66,6 +67,24 @@ _CONDITION_TERMS = [
 _ALL_TERMS = sorted(set(_MEDICATION_TERMS + _ALLERGY_TERMS + _CONDITION_TERMS), key=len, reverse=True)
 _DOSE_RE = re.compile(r"\b([A-Z][a-zA-Z]+)\s+\d+(\.\d+)?\s*(mg|mcg|g|units?)\b")
 
+# Structural (shape-based) candidate detection, not enumeration -- the same
+# principle _DOSE_RE already applies to medication doses, extended to
+# lab/vital values. Added 2026-09-18, investigating compare_signout_to_chart:
+# this is a real, if partial, fix for the recurring "_ALL_TERMS has no
+# vocabulary for tool X's facts" gap (get_recent_observations, then this
+# tool) -- a fabricated lab/vital value now becomes a candidate needing
+# grounding WITHOUT "potassium" or any lab name ever needing to be added to
+# a fixed list, because the match is on the number+unit shape, not a name.
+# Deliberately does NOT close the other half of that recurring gap (a bare
+# NAME-shaped claim, e.g. a fabricated condition or encounter type, has no
+# numeric shape to match on) -- no cheap structural fix exists for that
+# half; see COVERAGE.md's note on why expanding _ALL_TERMS incrementally
+# remains the accepted approach there, not a structural fix.
+_LAB_VALUE_RE = re.compile(
+    r"\b\d+(\.\d+)?\s*(mEq/L|mg/dL|mmHg|mmol/L|mcg/mL|ng/mL|g/dL|mIU/L|U/L|bpm|°C|°F|/min)\b",
+    re.IGNORECASE,
+)
+
 # Common clinical abbreviations that won't literally substring-match the
 # expanded form a tool returns (e.g. a model saying "COPD" against a
 # Condition.text of "Chronic obstructive pulmonary disease"). Caught this via
@@ -85,12 +104,30 @@ _CLINICAL_ALIASES = {
 }
 
 
+_LAB_VALUE_FORMATTING_RE = re.compile(r"[\s°]")
+
+
+def _normalize_lab_value(s: str) -> str:
+    """Strips whitespace and the degree symbol so a lab/vital value
+    compares equal regardless of cosmetic formatting differences between
+    how a tool stored it (app/tools.py's _observation_value_text formats
+    as "<value> <unit>", e.g. "38.9 C") and how the model naturally
+    writes it in prose (e.g. "38.9°C", no space, real degree symbol).
+    Found live: _LAB_VALUE_RE's new candidate detection caught a real,
+    tool-sourced temperature that then failed grounding on this exact
+    formatting mismatch, stripping a true fact from the response."""
+    return _LAB_VALUE_FORMATTING_RE.sub("", s)
+
+
 def _is_grounded(term: str, grounded: set[str]) -> bool:
     t = term.lower()
     if t in grounded or any(t in g for g in grounded):
         return True
     alias = _CLINICAL_ALIASES.get(t)
     if alias and (alias in grounded or any(alias in g or g in alias for g in grounded)):
+        return True
+    t_norm = _normalize_lab_value(t)
+    if t_norm != t and any(t_norm == _normalize_lab_value(g) or t_norm in _normalize_lab_value(g) for g in grounded):
         return True
     return False
 
@@ -109,52 +146,58 @@ class VerificationOutcome:
     enforced_warnings: list[str] = field(default_factory=list)
 
 
+def _ground_snapshot(vocab: set[str], snap: GetPatientSnapshotOutput) -> None:
+    vocab.update(part.lower() for part in snap.name.split())
+    for c in snap.conditions:
+        vocab.add(c.text.lower())
+    for m in snap.medications:
+        vocab.add(m.text.lower())
+        vocab.add(m.text.split()[0].lower())  # bare drug name, e.g. "metformin"
+    for a in snap.allergies:
+        vocab.add(a.text.lower())
+        if a.reaction:
+            vocab.add(a.reaction.lower())
+
+
+def _ground_encounters(vocab: set[str], enc_output: GetRecentEncountersOutput) -> None:
+    # Phase 6: an encounter's reason/type text can legitimately overlap with
+    # _ALL_TERMS' condition vocabulary (e.g. a visit reason of "diabetes
+    # follow-up") -- ground it the same way snapshot conditions are, so a
+    # real, sourced fact from this tool isn't falsely flagged as unverified.
+    for enc in enc_output.encounters:
+        vocab.add(enc.text.lower())
+
+
+def _ground_observations(vocab: set[str], obs_output: GetRecentObservationsOutput) -> None:
+    # UC2: grounds an observation's measured-thing text (e.g. "potassium")
+    # and its formatted value (e.g. "5.2 mEq/L") so a real, sourced fact
+    # from this tool isn't falsely flagged. Also reachable now via
+    # _LAB_VALUE_RE's structural candidate detection (added alongside
+    # compare_signout_to_chart), which doesn't need the measured-thing name
+    # in _ALL_TERMS at all -- but the bare name (e.g. "potassium") is still
+    # only a candidate if it happens to already be in _ALL_TERMS, which it
+    # generally isn't; that half of the gap is unchanged, see this module's
+    # docstring.
+    for obs in obs_output.observations:
+        vocab.add(obs.text.lower())
+        if obs.value:
+            vocab.add(obs.value.lower())
+
+
 def _grounded_vocabulary(records: list[ToolCallRecord]) -> set[str]:
     vocab: set[str] = set()
     for rec in records:
         if isinstance(rec.output, GetPatientSnapshotOutput):
-            snap = rec.output
-            vocab.update(part.lower() for part in snap.name.split())
-            for c in snap.conditions:
-                vocab.add(c.text.lower())
-            for m in snap.medications:
-                vocab.add(m.text.lower())
-                vocab.add(m.text.split()[0].lower())  # bare drug name, e.g. "metformin"
-            for a in snap.allergies:
-                vocab.add(a.text.lower())
-                if a.reaction:
-                    vocab.add(a.reaction.lower())
+            _ground_snapshot(vocab, rec.output)
         elif isinstance(rec.output, CheckAllergyConflictOutput):
             conf = rec.output
             vocab.add(conf.medication_name.lower())
             if conf.matched_allergy_text:
                 vocab.add(conf.matched_allergy_text.lower())
         elif isinstance(rec.output, GetRecentEncountersOutput):
-            # Phase 6: an encounter's reason/type text can legitimately
-            # overlap with _ALL_TERMS' condition vocabulary (e.g. a visit
-            # reason of "diabetes follow-up") -- ground it the same way
-            # snapshot conditions are, so a real, sourced fact from this
-            # tool isn't falsely flagged as unverified.
-            for enc in rec.output.encounters:
-                vocab.add(enc.text.lower())
+            _ground_encounters(vocab, rec.output)
         elif isinstance(rec.output, GetRecentObservationsOutput):
-            # UC2: grounds an observation's measured-thing text (e.g.
-            # "potassium") and its formatted value (e.g. "5.2 mEq/L") so a
-            # real, sourced fact from this tool isn't falsely flagged.
-            # NOTE, discovered while wiring this in: _ALL_TERMS below has
-            # no lab/vitals vocabulary at all, so _find_candidate_terms()
-            # won't treat a lab/vital claim as a "candidate needing
-            # grounding" in the first place regardless of this branch --
-            # same class of scannable-vocabulary gap this module's own
-            # docstring already documents for clinical abbreviations. This
-            # branch grounds the value for if/when that gap is closed; the
-            # gap itself is a separate, pre-existing limitation of
-            # source-attribution's coverage, not something introduced or
-            # closed by this tool addition.
-            for obs in rec.output.observations:
-                vocab.add(obs.text.lower())
-                if obs.value:
-                    vocab.add(obs.value.lower())
+            _ground_observations(vocab, rec.output)
         elif isinstance(rec.output, SummarizeShiftEventsOutput):
             # UC4: mostly redundant with the branches above, since the
             # underlying GetPatientSnapshotOutput/GetRecentEncountersOutput/
@@ -166,6 +209,26 @@ def _grounded_vocabulary(records: list[ToolCallRecord]) -> set[str]:
             # that specific phrasing wouldn't be grounded by anything else.
             for event in rec.output.events:
                 vocab.add(event.text.lower())
+        elif isinstance(rec.output, CompareSignoutToChartOutput):
+            # UC2: grounds the fresh data this tool fetched internally,
+            # which -- unlike every other tool -- never becomes its own
+            # separate ToolCallRecord (get_patient_snapshot/get_recent_
+            # encounters/get_recent_observations run *inside*
+            # compare_signout_to_chart's own function body, invisible to
+            # run_turn's dispatch loop). Without this branch, anything the
+            # model restates from the fresh fetch beyond the diff itself
+            # (e.g. "current potassium is 5.8") would be ungroundable.
+            # Reuses the exact same per-type grounding logic as the real
+            # top-level tools, applied to the nested current_* fields.
+            cmp = rec.output
+            for discrepancy in cmp.discrepancies:
+                vocab.add(discrepancy.text.lower())
+            if cmp.current_snapshot:
+                _ground_snapshot(vocab, cmp.current_snapshot)
+            if cmp.current_encounters:
+                _ground_encounters(vocab, cmp.current_encounters)
+            if cmp.current_observations:
+                _ground_observations(vocab, cmp.current_observations)
     return vocab
 
 
@@ -173,6 +236,7 @@ def _find_candidate_terms(text: str) -> list[str]:
     lowered = text.lower()
     found = [term for term in _ALL_TERMS if term in lowered]
     found += [m.group(1) for m in _DOSE_RE.finditer(text)]
+    found += [m.group(0) for m in _LAB_VALUE_RE.finditer(text)]
     # de-dupe, case-insensitive
     seen: set[str] = set()
     unique = []
@@ -228,7 +292,7 @@ def _check_domain_constraint(
     for med in med_candidates:
         if med.lower() in already_checked:
             continue
-        result = check_allergy_conflict(fhir, {"patient_id": patient_id, "medication_name": med})
+        result = check_allergy_conflict(fhir, {"patient_id": patient_id, "medication_name": med}, [])
         if not isinstance(result, CheckAllergyConflictOutput):
             continue  # tool failure here is logged separately by the caller
         if result.conflict_found:

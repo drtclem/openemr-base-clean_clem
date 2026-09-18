@@ -118,7 +118,7 @@ Each tool maps directly to a `USERS.md` use case. No tool exists that doesn't tr
 | `get_patient_snapshot` | Patient, Condition, AllergyIntolerance, MedicationRequest | 1, 3 |
 | `get_recent_encounters` | Encounter (filtered per 3.3) | 1, 2, 4 |
 | `get_recent_observations` | Observation, DiagnosticReport | 1, 2, 3 |
-| `compare_signout_to_chart` | Encounter, Condition, MedicationRequest (diff against a supplied sign-out text) | 2 |
+| `compare_signout_to_chart` | Patient, Condition, MedicationRequest, AllergyIntolerance, Encounter, Observation (fresh fetch, structurally diffed against `turn_records` -- deliberately does NOT take the sign-out's own text as input; see 3.1's UC2 addition note for why) | 2 |
 | `check_allergy_conflict` | AllergyIntolerance, MedicationRequest | 2, 3 (backs the domain-constraint layer, Section 3.2) |
 | `summarize_shift_events` | aggregates tool calls/results already made this session | 4 |
 
@@ -179,6 +179,22 @@ live test of the weaker initial wording (it synthesized an accurate summary dire
 without ever calling the tool). Strengthened to an explicit imperative afterward, but strengthened
 wording is still wording: nothing here is a code-level guarantee. Documented explicitly so this
 isn't later mistaken for the same category of protection §3.2 describes.
+
+**UC2 addition (`compare_signout_to_chart`), 2026-09-18 -- same "no nested LLM call" principle,
+investigated before building, not after:** verifying a sign-out claim against the chart genuinely
+requires interpreting free text, which is a natural-language judgment call this tool deliberately
+does not attempt. It does not take the sign-out's own text as input at all, and does not parse or
+semantically compare it -- putting that interpretation inside the tool would mean a second, nested
+LLM call whose output nothing in this architecture checks, the same risk named above for
+`summarize_shift_events`. Instead it does a fresh, unconditional fetch and structurally diffs it
+(by resource id, and by status for medications) against whatever `turn_records` already knew for
+this patient -- a data-shape comparison, not a semantic one. The sign-out's prose stays in the
+resident's own message, already in the outer model's context; the model connects the claim to the
+tool's structured diff in its final drafted response, which still passes through
+`verify_response()`'s existing grounding check. Named explicitly, matching the same discipline as
+above: this tool's freshness guarantee and diff logic are real, code-level properties; whether the
+model correctly *connects* a sign-out claim to that diff in its response is still the model's own
+reasoning, not something this tool enforces.
 
 ## 3.2 Domain constraint enforcement
 

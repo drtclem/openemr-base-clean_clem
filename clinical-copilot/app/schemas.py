@@ -191,6 +191,45 @@ class SummarizeShiftEventsOutput(BaseModel):
     )
 
 
+# --- compare_signout_to_chart (UC2, USERS.md) -------------------------------
+#
+# Deliberately does NOT take the sign-out's own text as input, and does not
+# attempt to parse or semantically compare it -- see app/tools.py's docstring
+# for the full reasoning. It structurally diffs a fresh, unconditional chart
+# fetch against whatever this conversation already knew (turn_records) for
+# this patient; the model itself connects that diff to the sign-out claim
+# already sitting in its own context (the resident's message), the same
+# division of labor every other tool uses. "baseline_established=False" means
+# there was nothing this conversation to diff against yet -- this fetch
+# becomes the new baseline, not a confirmation that nothing has changed.
+
+
+class CompareSignoutToChartInput(BaseModel):
+    patient_id: str = Field(..., description="OpenEMR FHIR Patient resource id (UUID).")
+
+
+class ChartDiscrepancy(BaseModel):
+    category: Literal["condition", "medication", "allergy", "encounter", "observation"]
+    text: str
+    source_resource: str
+
+
+class CompareSignoutToChartOutput(BaseModel):
+    patient_id: str
+    baseline_established: bool = Field(
+        ...,
+        description=(
+            "False if this conversation had nothing gathered yet for this patient to diff "
+            "against -- this fetch is now the baseline, not confirmation nothing has changed."
+        ),
+    )
+    discrepancies: list[ChartDiscrepancy]
+    current_snapshot: GetPatientSnapshotOutput | None = None
+    current_encounters: GetRecentEncountersOutput | None = None
+    current_observations: GetRecentObservationsOutput | None = None
+    partial_failures: list[str] = Field(default_factory=list)
+
+
 # --- shared tool-failure envelope (ARCHITECTURE.md Section 2, 4) ------------
 
 
