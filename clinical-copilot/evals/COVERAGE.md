@@ -550,11 +550,12 @@ silently absent:
   mechanism in `verification.py` and `app/tools.py`, prompted directly by
   the two `_LAB_VALUE_RE` bugs above.** The question asked: is that the
   last instance of "a bare substring collides with an unrelated mention"
-  in this codebase, or is there reason to think there's a fourth?
-  `app/tools.py` has exactly one regex (`_HTML_TAG_RE`, mechanical tag
-  stripping, no semantic matching, clean). `verification.py` had **three
-  more confirmed live**, all in code paths that had never been
-  specifically stress-tested against this exact failure shape:
+  in this codebase, or is there reason to think there's a fourth? Answer:
+  there was, and it's fixed too (item 4 below). `app/tools.py` has
+  exactly one regex (`_HTML_TAG_RE`, mechanical tag stripping, no
+  semantic matching, clean). `verification.py` had **four more confirmed
+  live**, all in code paths that had never been specifically
+  stress-tested against this exact failure shape:
   1. **Most severe**: the allergy-conflict HARD STOP's "already mentioned"
      check used bare `"conflict"`, which collides with unrelated uses (`"a
      scheduling conflict"`, `"the two records conflict on her DOB"`) and
@@ -588,18 +589,40 @@ silently absent:
      "documented"/"on file"/"noted" -- catches compound phrasings ("no
      conditions, medications, or allergies are recorded") a narrower,
      more literal fix would have missed.
+  4. `_DOSE_RE` itself -- the same pattern `_LAB_VALUE_RE` was modeled on,
+     and the last item of the audit, fixed separately after items 1-3:
+     it assumed the capitalized word immediately *before* a dose is
+     always the drug name, so "Started 10 mg Lisinopril daily" captured
+     "Started", stripping the whole correct sentence. Unlike 1-3, this
+     one fails *visibly* (a `[Verification note: I removed N
+     detail(s)...]` marker still appears), the same category as the
+     `_LAB_VALUE_RE` bugs, not the silent-failure category of 1-3. Fixed
+     with `_dose_candidates`: checks both sides of the dose pattern in
+     one match, preferring a real drug name found immediately *after*
+     the dose+unit when one exists, and excluding the preceding word by
+     a verb-suffix morphological check (`-ed`/`-ing`) when it doesn't.
+     Honestly disclosed rather than hidden: pure morphology can't catch
+     irregular participles ("Given") or non-drug sequence nouns ("Day
+     3") without real POS tagging, so a small, explicitly-scoped,
+     grammatically-motivated exception set (`_DOSE_NON_DRUG_WORDS`)
+     covers those two specifically -- a different kind of fix from the
+     fabrication-phrase keyword lists corrected in 1-3, closer to a
+     standard NLP stopword filter than an enumerated blocklist.
 
-  All three share the same risk shape as `_LAB_VALUE_RE`'s bugs but are
-  arguably worse: 1-3 fail **silently** (no verification note, nothing
-  visibly different in the response), where the earlier `_LAB_VALUE_RE`/
-  `_DOSE_RE`-class bugs at least leave a `[Verification note: I removed N
+  1-3 share the same risk shape as `_LAB_VALUE_RE`'s bugs but are
+  arguably worse: they fail **silently** (no verification note, nothing
+  visibly different in the response), where `_LAB_VALUE_RE`/`_DOSE_RE`
+  (item 4) at least leave a `[Verification note: I removed N
   detail(s)...]` marker that something was stripped, even if the reason
-  was spurious. Each fix has its own dedicated regression test in
-  `evals/unit_tests.py` (below), each asserting both directions: the
-  false-positive scenario no longer silences the safety append, and a
-  genuine self-correction still doesn't get a redundant one. Full Golden
-  Set re-run clean after landing (18/18, gate PASS) to confirm touching
-  this core production logic didn't regress anything else.
+  was spurious. Each of the four has its own dedicated regression test in
+  `evals/unit_tests.py` (below); 1-3 each assert both directions (the
+  false positive no longer silences the safety append, and a genuine
+  self-correction still doesn't get a redundant one), and 4 uses the
+  exact three collision sentences found during the audit plus a control
+  confirming a genuinely fabricated drug name in the same sentence shape
+  is still caught. Full Golden Set re-run clean after each landing
+  (18/18, gate PASS both times) to confirm touching this core production
+  logic didn't regress anything else.
 
 ## Unit-tier invariant checks (`evals/unit_tests.py`)
 
@@ -621,3 +644,4 @@ in test-runner output:
 | `test_allergy_hard_stop_not_silenced_by_unrelated_conflict_word` | regression | Most severe of three bugs found in a systematic audit of every regex/substring-match mechanism in `verification.py`, prompted by the two `_LAB_VALUE_RE` bugs above: the allergy-conflict HARD STOP's "already mentioned" check used a bare "conflict" substring, colliding with unrelated uses ("a scheduling conflict") and *silently* skipping the append -- no verification note, no signal to the resident at all, exactly what ARCHITECTURE.md 3.2 calls this mechanism a "wall" to prevent. Fixed with `_mentions_conflict_near_medication`, checking safe cues in a window around the specific medication mention rather than the whole response. Confirms the false positive no longer silences the HARD STOP, and a genuine self-correction still doesn't get a redundant one appended. |
 | `test_duplicate_warning_not_silenced_by_unrelated_records_mention` | regression | Second of the three, same audit, same severity class: bare "two records"/"multiple records" collided with unrelated mentions ("multiple records of prior vaccinations"), silently skipping the duplicate-patient-record caveat -- the exact "never silently drop" guarantee `c4_7_explicit_suppress_request`'s own `guards_against` text describes. Fixed with `_mentions_duplicate_warning`, requiring patient/chart/record-specific phrasing or the literal `other_patient_id`. |
 | `test_empty_chart_caveat_not_silenced_by_unrelated_no_problems_mention` | regression | Third of the three: bare "no problems"/"no medications" collided with unrelated uses ("no problems accessing this data"), silently skipping the empty-chart caveat. Fixed with `_mentions_empty_chart`, keeping a few specific standalone phrases and replacing the generic ones with a structural "no/none ... recorded/documented/on file/noted" pattern -- catches compound phrasings ("no conditions, medications, or allergies are recorded") that a narrower fix would have missed. |
+| `test_dose_candidate_finds_real_drug_not_preceding_verb` | regression | Fourth and last of the audit's findings, same class as `_LAB_VALUE_RE`'s two bugs: `_DOSE_RE` assumed the capitalized word immediately before a dose is always the drug name, so "Started 10 mg Lisinopril daily" captured "Started", stripping the whole correct sentence. Fixed structurally with `_dose_candidates`: checks both sides of the dose pattern and prefers a real drug name found immediately after it when one exists, falling back to the preceding word only if it isn't verb-shaped (a suffix-based morphological check, not enumeration). Honestly disclosed rather than papered over: pure morphology can't catch irregular participles ("Given") or non-drug sequence nouns ("Day 3") without real POS tagging, so a small, explicitly-scoped, grammatically-motivated exception set covers those two -- a different kind of fix from the fabrication-phrase keyword lists corrected elsewhere in this file. Uses the exact three collision sentences found during the audit, plus a control confirming a genuinely fabricated drug name in the same sentence shape is still caught. |

@@ -407,6 +407,70 @@ def test_empty_chart_caveat_not_silenced_by_unrelated_no_problems_mention(fhir: 
     return True, "an unrelated 'no problems' mention no longer silences the empty-chart caveat, and a genuine self-correction is still respected"
 
 
+def test_dose_candidate_finds_real_drug_not_preceding_verb(fhir: FhirClient) -> tuple[bool, str]:
+    """Regression test for the fourth bug from the same audit as the three
+    "mentions" fixes above, and the same class as the two _LAB_VALUE_RE
+    bugs: _DOSE_RE assumed the capitalized word immediately BEFORE a dose
+    is always the drug name -- found live, "Started 10 mg Lisinopril
+    daily" captured "Started", not "Lisinopril", stripping the whole
+    (correct) sentence. Fixed structurally: checks both sides of the dose
+    pattern and prefers a real drug name found immediately after the
+    dose+unit when one exists, falling back to the preceding word only
+    when it doesn't look verb-shaped (see _dose_candidates' own docstring
+    for the honestly-disclosed limit of pure morphology here -- "Given"
+    and "Day" needed a small supplementary exclusion, not the same kind
+    of fix as the fabrication-phrase keyword lists elsewhere in this
+    file).
+
+    Uses the exact three collision sentences found during the audit, plus
+    a control confirming detection isn't blanket-weakened.
+    """
+    snapshot = get_patient_snapshot(fhir, {"patient_id": f.PID1_ALICE}, [])
+    if not isinstance(snapshot, GetPatientSnapshotOutput):
+        return False, f"setup failed: couldn't fetch pid1 snapshot ({snapshot})"
+    record = ToolCallRecord(tool_name="get_patient_snapshot", patient_id=f.PID1_ALICE, output=snapshot)
+
+    # A real drug (Lisinopril, pid1's actual medication) present, with a
+    # verb -- not the drug name -- immediately preceding the dose.
+    real_drug_draft = "Started 10 mg Lisinopril daily for her hypertension."
+    outcome = verify_response(real_drug_draft, [record], f.PID1_ALICE, fhir)
+    if any("started" in c.lower() for c in outcome.flagged_claims):
+        return False, (
+            "'Started' was incorrectly treated as the drug-name candidate instead of "
+            f"'Lisinopril', got flagged_claims={outcome.flagged_claims}"
+        )
+    if real_drug_draft not in outcome.final_response:
+        return False, "the real, grounded Lisinopril sentence was stripped instead of surviving"
+
+    # No real drug present at all in either sentence -- the false-positive
+    # word (Given / Day) must not be flagged, since there's nothing here
+    # to fabricate a claim about.
+    for draft in ["Given 4 g IV push.", "On Day 3 units of blood were transfused."]:
+        no_drug_outcome = verify_response(draft, [record], f.PID1_ALICE, fhir)
+        if no_drug_outcome.flagged_claims:
+            return False, (
+                f"expected no flagged claims for {draft!r} (no real drug name present), got "
+                f"flagged_claims={no_drug_outcome.flagged_claims}"
+            )
+
+    # Control: a genuinely fabricated drug name (not in the tool output)
+    # in the same "verb dose unit DRUG" shape must still be caught -- the
+    # fix prefers the following word, it doesn't stop checking it.
+    fabricated_draft = "Started 20 mg Fakenstatin daily for her cholesterol."
+    fabricated_outcome = verify_response(fabricated_draft, [record], f.PID1_ALICE, fhir)
+    if not any("fakenstatin" in c.lower() for c in fabricated_outcome.flagged_claims):
+        return False, (
+            "control failed: a genuinely fabricated drug name (Fakenstatin, not in the tool "
+            f"output) should still be flagged, got flagged_claims={fabricated_outcome.flagged_claims}"
+        )
+
+    return True, (
+        "the real drug name (not the preceding verb) is correctly extracted and grounds, the "
+        "no-drug-present sentences don't get a false-positive word flagged, and a genuinely "
+        "fabricated drug name in the same shape is still caught"
+    )
+
+
 # --- (c) app/sensitivity.py -- pure functions, no FHIR/network needed at all,
 # but kept in this LLM-free suite (not evals/cases.py) since they need no
 # model call either. Phase 1's empirical finding this guards: a real
@@ -582,6 +646,7 @@ TESTS: list[tuple[str, Callable[[FhirClient], tuple[bool, str]]]] = [
     ("allergy_hard_stop_not_silenced_by_unrelated_conflict_word", test_allergy_hard_stop_not_silenced_by_unrelated_conflict_word),
     ("duplicate_warning_not_silenced_by_unrelated_records_mention", test_duplicate_warning_not_silenced_by_unrelated_records_mention),
     ("empty_chart_caveat_not_silenced_by_unrelated_no_problems_mention", test_empty_chart_caveat_not_silenced_by_unrelated_no_problems_mention),
+    ("dose_candidate_finds_real_drug_not_preceding_verb", test_dose_candidate_finds_real_drug_not_preceding_verb),
     ("sensitivity_filter_excludes_high_for_clin", test_sensitivity_filter_excludes_high_for_clin),
     ("sensitivity_filter_allows_high_for_doc", test_sensitivity_filter_allows_high_for_doc),
     ("domain_constraint_backstop_survives_missing_patient_id", test_domain_constraint_backstop_survives_missing_patient_id),

@@ -66,7 +66,58 @@ _CONDITION_TERMS = [
 ]
 
 _ALL_TERMS = sorted(set(_MEDICATION_TERMS + _ALLERGY_TERMS + _CONDITION_TERMS), key=len, reverse=True)
-_DOSE_RE = re.compile(r"\b([A-Z][a-zA-Z]+)\s+\d+(\.\d+)?\s*(mg|mcg|g|units?)\b")
+
+# Fixed 2026-09-18, fourth of four bugs from the same audit as
+# _mentions_conflict_near_medication/_mentions_duplicate_warning/
+# _mentions_empty_chart above: the original single-pattern regex assumed
+# the capitalized word immediately BEFORE a dose is always the drug name
+# -- found live, "Started 10 mg Lisinopril daily" captured "Started", not
+# "Lisinopril", stripping the whole (correct) sentence. Structural fix,
+# not a bigger keyword list: checks BOTH sides of the dose pattern in one
+# match (an optional preceding group and an optional following group),
+# and prefers a real drug name found immediately AFTER the dose+unit (the
+# "verb dose unit DRUG" clinical phrasing) over the preceding word when
+# one exists. The following group excludes all-caps route/frequency
+# abbreviations (IV, PO, BID) via [A-Z][a-z]+ (mixed case only).
+_DOSE_RE = re.compile(
+    r"\b(?:([A-Z][a-zA-Z]+)\s+)?\d+(?:\.\d+)?\s*(?:mg|mcg|g|units?)\b(?:\s+(?:of\s+)?([A-Z][a-z]+))?"
+)
+
+# When no following candidate exists, the preceding word is excluded if it
+# has a common English past-tense/participle suffix ("Continued",
+# "Increased", "Administered") -- essentially never a suffix of a real
+# drug name. A morphological (shape-based) exclusion, not an enumerated
+# word list.
+_DOSE_VERB_SUFFIX_RE = re.compile(r"(ed|ing)$", re.IGNORECASE)
+
+# The suffix rule above doesn't catch irregular English participles
+# ("Given") or non-drug nouns that happen to precede a number in clinical
+# shorthand ("Day 3", as in "On Day 3 units of blood were transfused").
+# Honestly disclosed, not papered over: no general morphological rule
+# distinguishes these from a genuinely short real drug name (Advil,
+# Xanax, Norco, Ambien are all 5-6 letters) without actual POS tagging,
+# which is out of scope for a regex fix. This is a small,
+# grammatically-motivated supplement (administration verbs and clinical
+# sequence nouns) needed only because pure morphology can't cover
+# irregular verbs -- not the same kind of fix as the fabrication-phrase
+# keyword lists corrected elsewhere in this file; it exists to patch the
+# one gap the structural rule above can't close on its own.
+_DOSE_NON_DRUG_WORDS = {"given", "day", "week", "month", "year", "visit", "encounter", "dose", "admission"}
+
+
+def _dose_candidates(text: str) -> list[str]:
+    candidates = []
+    for m in _DOSE_RE.finditer(text):
+        preceding, following = m.group(1), m.group(2)
+        if following:
+            candidates.append(following)
+        elif (
+            preceding
+            and not _DOSE_VERB_SUFFIX_RE.search(preceding)
+            and preceding.lower() not in _DOSE_NON_DRUG_WORDS
+        ):
+            candidates.append(preceding)
+    return candidates
 
 # Structural (shape-based) candidate detection, not enumeration -- the same
 # principle _DOSE_RE already applies to medication doses, extended to
@@ -299,7 +350,7 @@ def _grounded_vocabulary(records: list[ToolCallRecord]) -> set[str]:
 def _find_candidate_terms(text: str) -> list[str]:
     lowered = text.lower()
     found = [term for term in _ALL_TERMS if term in lowered]
-    found += [m.group(1) for m in _DOSE_RE.finditer(text)]
+    found += _dose_candidates(text)
     found += [
         m.group(0)
         for m in _LAB_VALUE_RE.finditer(text)
