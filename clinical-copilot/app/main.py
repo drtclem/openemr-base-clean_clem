@@ -21,15 +21,14 @@ from pathlib import Path
 
 import anthropic
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Cookie, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 from app.agent import ClinicalCopilotAgent
-from app.auth import OAuthTokenProvider
 from app.config import get_settings
-from app.fhir_client import FhirClient
 from app.observability import TurnObserver
+from app.oauth_session import SESSION_COOKIE_NAME, LoginError, SessionStore
 from app.verification import ToolCallRecord
 
 _READINESS_TIMEOUT_S = 2.5
@@ -73,10 +72,14 @@ async def request_timing_middleware(request: Request, call_next):
 
 
 _settings = get_settings()
-_tokens = OAuthTokenProvider(_settings)
-_fhir = FhirClient(_settings, _tokens)
 _observer = TurnObserver(_settings)
-_agent = ClinicalCopilotAgent(_settings, _fhir, _observer)
+_agent = ClinicalCopilotAgent(_settings, observer=_observer)
+# No default_fhir: Phase 1 (CLAUDE_CODE_BUILD_INSTRUCTIONS.md) removed the
+# single shared password-grant credential from the live path -- every
+# /chat call below resolves and passes its own resident-scoped FhirClient
+# explicitly. An accidental omission raises in run_turn() rather than
+# silently falling back to a shared identity.
+_sessions = SessionStore(_settings)
 
 
 @dataclass
@@ -227,10 +230,29 @@ _UI_HTML = """<!doctype html>
     cursor: pointer;
   }
   button:disabled { opacity: 0.5; cursor: default; }
+  .login-link {
+    display: inline-block;
+    padding: 0.5rem 1rem;
+    border-radius: 6px;
+    background: #2563eb;
+    color: white;
+    text-decoration: none;
+  }
+  #resident { font-size: 0.85rem; opacity: 0.75; margin-bottom: 1rem; }
 </style>
 </head>
 <body>
   <h1>Clinical Co-Pilot</h1>
+
+  <div id="loginGate" style="display:none;">
+    <p>Log in with your OpenEMR account to use the Co-Pilot -- Phase 1
+       (CLAUDE_CODE_BUILD_INSTRUCTIONS.md) requires a real resident session,
+       not anonymous access.</p>
+    <a class="login-link" href="/login?next=/ui">Log in with OpenEMR</a>
+  </div>
+
+  <div id="chatApp" style="display:none;">
+  <div id="resident"></div>
   <div class="patient-row">
     <label for="patientId">Patient ID</label>
     <input id="patientId" value="__DEFAULT_PATIENT_ID__">
@@ -240,13 +262,35 @@ _UI_HTML = """<!doctype html>
     <input id="message" placeholder="Ask about this patient..." autocomplete="off">
     <button id="send">Send</button>
   </div>
+  </div>
 
 <script>
 let conversationId = null;
+const loginGate = document.getElementById("loginGate");
+const chatApp = document.getElementById("chatApp");
+const residentLabel = document.getElementById("resident");
 const thread = document.getElementById("thread");
 const messageInput = document.getElementById("message");
 const patientIdInput = document.getElementById("patientId");
 const sendButton = document.getElementById("send");
+
+async function checkSession() {
+  try {
+    const resp = await fetch("/me");
+    if (resp.ok) {
+      const data = await resp.json();
+      chatApp.style.display = "";
+      loginGate.style.display = "none";
+      residentLabel.textContent = data.resident ? `Logged in as ${data.resident}` : "Logged in";
+    } else {
+      chatApp.style.display = "none";
+      loginGate.style.display = "";
+    }
+  } catch (err) {
+    loginGate.style.display = "";
+  }
+}
+checkSession();
 
 function appendMessage(who, text, meta, isError) {
   const div = document.createElement("div");
@@ -322,17 +366,82 @@ def ui() -> str:
     """Minimal, self-contained chat page -- a grader convenience, not a
     replacement for the real OpenEMR-embedded module (ARCHITECTURE.md
     1.1), which remains future work. No build step, no new dependency:
-    plain HTML/CSS/JS served directly from this route."""
+    plain HTML/CSS/JS served directly from this route. Whether the chat
+    form or a "Log in with OpenEMR" prompt renders is decided client-side
+    by the page's own call to GET /me -- see that route below."""
     return _UI_HTML
 
 
+@app.get("/login")
+def login(next: str = "/ui") -> RedirectResponse:
+    """Starts the authorization_code flow: redirects the browser to
+    OpenEMR's own login/authorize page. Phase 1 (CLAUDE_CODE_BUILD_
+    INSTRUCTIONS.md) -- replaces the shared password-grant credential
+    with a token bound to whichever resident actually logs in here,
+    per ARCHITECTURE.md 1.3."""
+    return RedirectResponse(_sessions.build_authorize_url(next_url=next))
+
+
+@app.get("/callback")
+def callback(code: str, state: str) -> RedirectResponse:
+    """OpenEMR redirects here after the resident logs in. Exchanges the
+    code for tokens, creates a session, sets the session cookie, and
+    sends the browser on to wherever /login's `next` pointed (default
+    /ui)."""
+    try:
+        session_id, next_url = _sessions.complete_login(code=code, state=state)
+    except LoginError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    response = RedirectResponse(next_url)
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        # The droplet serves plain HTTP on 8420 today (documented,
+        # accepted-risk grading exposure) -- a blanket Secure flag would
+        # silently break login there, since browsers drop Secure cookies
+        # over a non-TLS connection. Revisit once a TLS-fronted deployment
+        # exists (clinical-copilot/README.md Known Gaps).
+        secure=_settings.copilot_base_url.startswith("https://"),
+        samesite="lax",
+    )
+    return response
+
+
+@app.get("/me")
+def me(request: Request) -> JSONResponse:
+    """Used by /ui's own JS to decide whether to show the chat form or a
+    login prompt -- also handy for a quick curl-based liveness check of
+    whether a session cookie is still valid."""
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    session = _sessions.get(session_id)
+    if session is None:
+        return JSONResponse(status_code=401, content={"authenticated": False})
+    return JSONResponse(content={"authenticated": True, "resident": session.resident_username})
+
+
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
+def chat(
+    request: ChatRequest,
+    copilot_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+) -> ChatResponse:
+    session = _sessions.get(copilot_session)
+    if session is None:
+        # No more anonymous access and no shared fallback credential --
+        # Phase 1's whole point. A curl caller now needs a real session
+        # cookie from completing /login first; see README's updated
+        # "Try it directly" section.
+        raise HTTPException(
+            status_code=401,
+            detail="Not logged in. Open /login (or /ui, which will prompt) to start an OpenEMR session first.",
+        )
+
     conversation_id = request.conversation_id or str(uuid.uuid4())
     state = _conversations.get(conversation_id, _ConversationState())
 
     result = _agent.run_turn(
-        state.history, request.message, request.patient_id, state.tool_records
+        state.history, request.message, request.patient_id, state.tool_records, fhir=session.fhir
     )
     _conversations[conversation_id] = _ConversationState(
         history=result.updated_history, tool_records=result.accumulated_tool_records

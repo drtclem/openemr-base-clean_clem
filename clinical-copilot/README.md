@@ -35,14 +35,30 @@ curl -sk -X POST -H 'Content-Type: application/json' \
 ```
 
 Save the returned `client_id` / `client_secret` into `.env`. Then, from
-`docker/development-easy`, enable the client and grant it the password
-grant type (both disabled by default -- see `architecture-audit.md` 6.1 and
-"Known gaps" below):
+`docker/development-easy`, enable the client, grant it the password grant
+type (both disabled by default -- see `architecture-audit.md` 6.1 and
+"Known gaps" below), point its `redirect_uri` at this app's real `/callback`
+(the registration above used a placeholder), and add `user/Encounter.read`
+to its allowed `scope` (needed for the Phase 1 sensitivity-filter work, see
+ARCHITECTURE.md 3.3 -- the FHIR API omits this resource's sensitivity field
+entirely, and OpenEMR won't grant a scope a client isn't registered for
+regardless of what the consent screen shows):
 
 ```bash
 docker compose exec openemr mysql -h mysql -uroot -proot -D openemr -e \
-  "UPDATE oauth_clients SET is_enabled=1, grant_types='authorization_code|password|refresh_token' WHERE client_id='<your client_id>';"
+  "UPDATE oauth_clients SET is_enabled=1, grant_types='authorization_code|password|refresh_token', \
+   redirect_uri=CONCAT(redirect_uri, '|http://localhost:8420/callback'), \
+   scope=CONCAT(scope, ' user/Encounter.read') \
+   WHERE client_id='<your client_id>';"
 ```
+
+Password grant stays enabled for one reason: the automated eval suite
+(`evals/run_evals.py`) has no browser to complete an interactive login, so it
+authenticates with a fixed service credential -- that's an intentional,
+scoped decision for offline/CI-style regression runs only. **The live
+`/chat`/`/ui` path never uses it** -- every resident-facing request is
+scoped to whichever real login completed `authorization_code` (Phase 1,
+`CLAUDE_CODE_BUILD_INSTRUCTIONS.md`; see `app/oauth_session.py`).
 
 ### 2. Set the remaining `.env` values
 
@@ -53,6 +69,18 @@ docker compose exec openemr mysql -h mysql -uroot -proot -D openemr -e \
   `UPDATE users_secure SET password='$(php -r "echo password_hash('pass', PASSWORD_BCRYPT, ['cost'=>12]);")' WHERE username='admin';`
 - `ANTHROPIC_API_KEY`: required, no default.
 - `OPENEMR_VERIFY_TLS=false` (self-signed local dev cert only).
+- `COPILOT_BASE_URL`: where this app itself is reachable -- defaults to
+  `http://localhost:8420`, matching the `redirect_uri` registered above.
+  Must be updated (and the client's registered `redirect_uri` updated to
+  match) if you run this somewhere else, e.g. the droplet.
+- `OPENEMR_SCOPE_TEST_USERNAME` / `OPENEMR_SCOPE_TEST_PASSWORD`: optional.
+  A dedicated low-privilege demo account (`copilot_resident_1`, ACL group
+  `clin`, Provider off, no High-sensitivity grant -- mirrors `clin_1` per
+  `audit-notes.md`, created the same way via the real Add User admin form)
+  used only by `evals/cases.py`'s `oauth_scope_enforcement_denied` case and
+  for manually verifying scope restriction against a real
+  `authorization_code` token. Never a real resident's credential; the eval
+  case skips (not fails) if unset.
 
 ### 3. (Optional but recommended) bring up Langfuse
 
@@ -82,14 +110,24 @@ skips sending to Langfuse.
 uvicorn app.main:app --reload --port 8420
 ```
 
+`/chat` requires a real OpenEMR login (Phase 1, `CLAUDE_CODE_BUILD_INSTRUCTIONS.md`) -- there is no
+more anonymous/shared-credential access. Open http://localhost:8420/ui in a browser, click **Log in
+with OpenEMR** (`admin`/`pass`, or any real account), and use the chat form; the page handles the
+session cookie for you and keeps `conversation_id` across turns automatically.
+
+A bare `curl -X POST /chat` with no session cookie now gets a clean 401 by design:
+
 ```bash
-curl -X POST http://localhost:8420/chat \
+curl -i -X POST http://localhost:8420/chat \
   -H 'Content-Type: application/json' \
   -d '{"message": "Give me a quick orientation on this patient.", "patient_id": "<a FHIR Patient id>"}'
+# HTTP/1.1 401 Unauthorized
 ```
 
-Send a second request with the same `conversation_id` from the first
-response to continue the conversation.
+To drive `/chat` from curl/scripts instead of `/ui`, complete the browser login once, capture the
+`copilot_session` cookie your browser's dev tools shows after `/callback` redirects, and pass it as
+`-H "Cookie: copilot_session=<value>"` on subsequent requests -- the session lives in-memory on the
+server for as long as the process runs (see `app/oauth_session.py`).
 
 ## Running the eval suite
 
@@ -97,12 +135,14 @@ response to continue the conversation.
 python3 -m evals.run_evals
 ```
 
-Runs all 7 cases (`evals/cases.py`) against the live agent -- real Anthropic
+Runs all 9 cases (`evals/cases.py`) against the live agent -- real Anthropic
 calls, real FHIR calls. Prints a pass/fail table and writes full detail to
 `evals/last_run_results.json` (git-ignored: it's a run artifact, not the
 deliverable -- the suite code is the deliverable). Each case documents its
 category (boundary / invariant / regression / adversarial, per
 `ARCHITECTURE.md` 7.1) and the specific failure mode it guards against.
+`oauth_scope_enforcement_denied` (Phase 1) records a labeled `SKIP`, not a
+pass or failure, if `OPENEMR_SCOPE_TEST_USERNAME`/`_PASSWORD` aren't set.
 
 ## Bruno API collection
 
@@ -151,14 +191,33 @@ collection was committed.
 
 ## Known gaps (stated honestly, not fixed under time pressure)
 
-- **OAuth grant type.** `ARCHITECTURE.md` 1.3 calls for a `user/`-scoped
-  token bound to the resident's own `authorization_code` session. This build
-  uses the `password` grant with a single configured credential instead --
-  still `user/`-scoped and still centrally audited (`architecture-audit.md`
-  6.1-6.4), but NOT bound to an individual resident's session, so the "access
-  ceiling no higher than the resident's own" property doesn't hold yet. See
-  `app/auth.py`'s docstring. Migrating to `authorization_code` is the first
-  thing to do before this touches real patients.
+- **OAuth grant type -- RESOLVED for live traffic (Phase 1,
+  `CLAUDE_CODE_BUILD_INSTRUCTIONS.md`).** `/chat`/`/ui` now use a real
+  `authorization_code` login bound to whichever resident actually
+  authenticates (`app/oauth_session.py`), matching `ARCHITECTURE.md` 1.3.
+  Password grant still exists in `app/auth.py` but is used only by the
+  automated eval suite (`evals/run_evals.py`), which has no browser to
+  complete an interactive login -- that's a deliberate, scoped exception
+  for offline regression runs, not a live-traffic path.
+- **Cross-provider patient access is a separate, still-open OpenEMR ACL
+  gap** that the `authorization_code` migration does not fix, and can't --
+  `audit-notes.md` confirmed live in the UI that a physician (`dr_1`) could
+  fully open, edit, and create encounters on another provider's patient
+  (pid 4, admin's). Because that's a platform-level, UI-visible gap (not
+  something the FHIR API adds on top of), a resident-scoped token's access
+  ceiling is only as good as what OpenEMR's own ACL already grants that
+  resident directly -- which today includes other providers' patients.
+  Named honestly rather than silently tested around; a genuine future
+  threat-model item.
+- **The FHIR Encounter resource carries no sensitivity field at all** --
+  confirmed by both code read and a live test (`architecture-audit.md`
+  6.9): a real `authorization_code`-obtained `user/`-scoped token's
+  `Encounter` search returns a known `sensitivity='high'` test encounter in
+  full, same as a `system/`-scoped one. The compensating filter
+  (`app/sensitivity.py`) is real, load-bearing work, not a defensive
+  no-op -- see `ARCHITECTURE.md` 3.3. It's built and unit-tested but not
+  yet wired into a live tool, since `get_recent_encounters` (the tool that
+  would call it) isn't built until a later phase.
 - **Source-attribution verification is a curated-vocabulary substring match**
   (`app/verification.py`), not full per-claim tagging. It will miss a
   clinical claim phrased outside `_MEDICATION_TERMS` / `_ALLERGY_TERMS` /
@@ -179,19 +238,23 @@ collection was committed.
   are not built yet, per the build prompt's explicit scope cut.
 - No `/health` / `/ready`, no Bruno collection, no load tests, no alerts --
   all explicitly deferred to Final Submission per the build prompt.
-- **`/chat` on the droplet (port 8420) has no authentication and is now
-  publicly reachable** -- required so graders can exercise it directly,
-  per the Bruno collection's `droplet` environment note above. The real
-  risk: anyone who finds the port can trigger real, cost-incurring
-  Anthropic API calls against it, not just read data. This is a
-  deliberate decision, not an oversight: accepted for the grading window
-  because the Anthropic account's own hard spend ceiling caps worst-case
-  damage, and the exposure is temporary, not a permanent posture. The
-  fix -- a shared-secret header check in front of `/chat` -- is named as
-  the next step once grading is done, not urgent tonight.
+- **`/chat` on the droplet (port 8420) no longer has the open, no-auth
+  reachability previously documented here** -- superseded by Phase 1's
+  `authorization_code` login requirement above. A bare `curl -X POST
+  /chat` now gets a clean 401; a real OpenEMR login is required first.
+  This removes the earlier accepted risk (anyone triggering real,
+  cost-incurring Anthropic calls with zero auth) as a side effect of doing
+  the auth migration properly, not as a separate fix.
+- **The Bruno collection (`bruno/`) predates this change** and its saved
+  `/chat` requests will now get 401s as-is -- they were built against the
+  anonymous-access version of `/chat`. Each request needs a `copilot_session`
+  cookie (captured from a browser after completing `/login`) added manually
+  until the collection itself is updated to document/automate this;
+  `/health` and `/ready` are unaffected, they never required auth.
 - No OpenEMR module / chart UI entry point (`ARCHITECTURE.md` 1.1) yet. A
   minimal `GET /ui` chat page (plain HTML/CSS/JS, no build step, same
-  FastAPI app/port) now exists as a standalone grader convenience so
-  there's something to click instead of only curl -- see the top-level
-  README. It does not replace the real chart-embedded module, which
-  remains the actual planned next step per `ARCHITECTURE.md` 1.1.
+  FastAPI app/port) exists as a standalone grader convenience, now gated
+  behind the same real OpenEMR login as `/chat` (see the top-level README)
+  rather than being anonymously reachable. It does not replace the real
+  chart-embedded module, which remains the actual planned next step per
+  `ARCHITECTURE.md` 1.1.

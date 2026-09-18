@@ -98,10 +98,16 @@ would see restricted visits the resident themselves cannot open. Binding the age
 resident's own authenticated session means the agent's access ceiling is, at minimum, no higher
 than what that resident could already reach by clicking around OpenEMR directly.
 
-**Open item, stated honestly:** whether a `user/`-scoped token actually *does* enforce sensitivity
-filtering was never tested (architecture-audit.md §6.6 flags this explicitly as unverified). This
-document does not assume it works. See Section 3.3 for the compensating control built regardless
-of the answer.
+**Resolved (Phase 1, 2026-09-17):** architecture-audit.md §6.6 flagged whether a `user/`-scoped
+token enforces sensitivity filtering as untested. It's now tested, live, against pid4's known
+`sensitivity='high'` test encounter (audit-notes.md's "AUDIT TEST: encounter created by dr_1,
+attributed to admin, sensitivity high", form_encounter id 1 / encounter 7): a real
+`authorization_code`-obtained `user/`-scoped token's `GET /Encounter?patient=...` returned it in
+full, identical to Finding 12's `system/`-scope result. **`user/` scope does not enforce
+sensitivity filtering either** -- this was never a UI-only gap that a better grant type would
+close on its own. Section 3.3's compensating control is not a defensive no-op; it is the only
+thing standing between a restricted visit and the model's context, confirmed necessary rather than
+assumed necessary.
 
 # 2. Tool design
 
@@ -172,14 +178,20 @@ cannot.
 
 ## 3.3 Sensitivity compensating control
 
-Because whether the resident's own `user/`-scoped token enforces sensitivity filtering is
-unverified (Section 1.3), `get_recent_encounters` and any tool touching encounter data applies its
-own filter: any encounter this resident's role would not be permitted to view under OpenEMR's own
-ACL (the audit's role matrix shows the `clin`/physician-covering roles this persona maps to do not
-hold a High sensitivity grant) is excluded from what reaches the model's context entirely, not just
-hidden from the final response. This is deliberately redundant with whatever the platform itself
-does, if the platform's own filtering turns out to work, this is a no-op; if it doesn't, this is
-the only thing standing between a restricted visit and the model's context window.
+Confirmed necessary, not just deliberately redundant (Section 1.3): a resident's own `user/`-scoped
+token does not enforce sensitivity filtering either, so `get_recent_encounters` and any tool
+touching encounter data must apply its own filter -- any encounter this resident's role would not
+be permitted to view under OpenEMR's own ACL (the audit's role matrix shows the `clin`/
+physician-covering roles this persona maps to do not hold a High sensitivity grant) is excluded
+from what reaches the model's context entirely, not just hidden from the final response.
+
+**Implementation note:** the FHIR `Encounter` resource carries no sensitivity marker at all --
+`src/Services/FHIR/FhirEncounterService.php` never maps `form_encounter.sensitivity` into any FHIR
+field or extension, so this isn't just unfiltered, the FHIR representation doesn't expose the value
+to filter on. The compensating control (`clinical-copilot/app/sensitivity.py`) therefore sources
+`sensitivity` from OpenEMR's own standard REST API (`GET /apis/default/api/patient/{puuid}/
+encounter`, `api:oemr` scope) instead of FHIR -- still "OpenEMR's REST/FHIR API" per Section 1.3,
+not a direct-database read.
 
 # 4. Failure modes
 

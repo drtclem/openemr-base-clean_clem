@@ -40,6 +40,32 @@ class OAuthTokenProvider:
         self._access_token: str | None = None
         self._refresh_token: str | None = None
         self._expires_at: float = 0.0
+        self._allow_password_login: bool = True
+
+    @classmethod
+    def from_authorization_code_tokens(
+        cls,
+        settings: Settings,
+        *,
+        access_token: str,
+        refresh_token: str | None,
+        expires_in: float,
+        client: httpx.Client | None = None,
+    ) -> "OAuthTokenProvider":
+        """Seeds a provider directly from an `authorization_code` token
+        response (app/oauth_session.py) -- bound to whichever resident
+        actually logged in, per ARCHITECTURE.md 1.3. Deliberately never
+        calls `_login()`: if `refresh_token` is later exhausted/revoked,
+        `get_token()` raises instead of falling back to password-grant --
+        the caller's session is simply dead, never silently replaced by
+        the shared service credential.
+        """
+        provider = cls(settings, client)
+        provider._access_token = access_token
+        provider._refresh_token = refresh_token
+        provider._expires_at = time.monotonic() + float(expires_in)
+        provider._allow_password_login = False
+        return provider
 
     def get_token(self) -> str:
         with self._lock:
@@ -50,7 +76,13 @@ class OAuthTokenProvider:
                     self._refresh()
                     return self._access_token  # type: ignore[return-value]
                 except TokenAcquisitionError:
+                    if not self._allow_password_login:
+                        raise
                     pass  # fall through to a fresh password-grant login
+            if not self._allow_password_login:
+                raise TokenAcquisitionError(
+                    "Resident session's token expired and could not be refreshed; a fresh login is required."
+                )
             self._login()
             return self._access_token  # type: ignore[return-value]
 

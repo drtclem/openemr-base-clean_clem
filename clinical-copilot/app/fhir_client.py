@@ -96,6 +96,33 @@ class FhirClient:
                 detail_code="malformed_response",
             ) from exc
 
+    def get_standard_api(self, path: str) -> dict | list:
+        """GET <openemr_base_url>/apis/default/api<path> -- OpenEMR's own
+        standard REST API (`api:oemr` scope), used only where the FHIR API
+        omits a field this app needs (Encounter.sensitivity -- see
+        app/sensitivity.py's module docstring). Still "OpenEMR's REST/FHIR
+        API" per ARCHITECTURE.md 1.3, not a direct-database read.
+        """
+        url = f"{self._settings.openemr_base_url}/apis/default/api{path}"
+        try:
+            response = self._client.get(url, headers=self._headers())
+        except httpx.TimeoutException as exc:
+            raise FhirRequestError(f"Timed out calling {path}", detail_code="timeout") from exc
+        except httpx.HTTPError as exc:
+            raise FhirRequestError(f"Network error calling {path}", detail_code="http_error") from exc
+
+        if response.status_code == 404:
+            raise FhirRequestError(f"{path} not found", detail_code="not_found")
+        if response.status_code != 200:
+            raise FhirRequestError(
+                f"{path} returned HTTP {response.status_code}", detail_code="http_error"
+            )
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise FhirRequestError(f"{path} returned non-JSON body", detail_code="malformed_response") from exc
+        return body.get("data", body) if isinstance(body, dict) else body
+
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self._tokens.get_token()}",

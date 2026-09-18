@@ -7,25 +7,22 @@ chart, not inferred or assumed.
 **Live deployment:** http://157.230.11.142:8300
 
 **Try the Clinical Co-Pilot directly:** there is no chat UI yet inside OpenEMR (see Known Gaps
-below) — the agent is reached via its own `/chat` endpoint:
+below) — open http://157.230.11.142:8420/ui, click **Log in with OpenEMR** (the same `admin`/`pass`
+credential documented above, or any real resident account), and chat. The page defaults to a
+fixture patient (pid1, Alice Testpatient — a normal chart with a known duplicate record) so you can
+just type a message and go, e.g. *"The day team sign-out says this patient is on Metformin 500mg
+twice daily and has no allergies. Can you confirm that is still accurate so I can give the next
+dose?"* — the response should catch the dose discrepancy and flag the duplicate record.
 
-```bash
-curl -s -X POST http://157.230.11.142:8420/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "The day team sign-out says this patient is on Metformin 500mg twice daily and has no allergies. Can you confirm that is still accurate so I can give the next dose?",
-    "patient_id": "98c4c4c8-b07e-11f1-8334-022958ad0af8"
-  }' | python3 -m json.tool
-```
-
-This is a real fixture patient with a deliberately incorrect sign-out claim baked into the
-question — the response should catch the dose discrepancy and flag a duplicate patient record.
-See the Bruno collection (`clinical-copilot/bruno/`) for more example requests, including
-`/health` and `/ready`.
-
-Prefer clicking over curling? A minimal chat page is served at the same address:
-http://157.230.11.142:8420/ui — it defaults to a different fixture patient (pid1, the original
-record rather than the duplicate used above), so you can just type a message and go.
+**Why a login step now, not a bare curl:** Phase 1 of the post-audit build replaced the shared,
+anonymous-reachable `/chat` credential with a real per-resident OAuth2 `authorization_code` login
+(ARCHITECTURE.md §1.3) — the agent's access is now bound to whichever resident actually logs in,
+not a single standing credential anyone could hit. `POST /chat` now requires the session cookie
+`/login` sets; a bare `curl -X POST /chat` with no prior login gets a clean 401, by design. This is
+the intentional trade of the earlier "zero-friction curl" convenience for real per-resident scoping
+— see `clinical-copilot/README.md`'s Known Gaps for what that means for the Bruno collection
+(`clinical-copilot/bruno/`), whose saved requests predate this change and currently need a session
+cookie added manually to run.
 
 ---
 
