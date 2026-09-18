@@ -546,6 +546,60 @@ silently absent:
   cue list verbatim -- same keyword-brittleness class as tonight's earlier
   `behavioral_coverage.py` audit, this time caught blocking the Golden
   Set's own gate. Broadened, verified against the exact failing transcript.
+- **CLOSED 2026-09-18: systematic audit of every regex/substring-match
+  mechanism in `verification.py` and `app/tools.py`, prompted directly by
+  the two `_LAB_VALUE_RE` bugs above.** The question asked: is that the
+  last instance of "a bare substring collides with an unrelated mention"
+  in this codebase, or is there reason to think there's a fourth?
+  `app/tools.py` has exactly one regex (`_HTML_TAG_RE`, mechanical tag
+  stripping, no semantic matching, clean). `verification.py` had **three
+  more confirmed live**, all in code paths that had never been
+  specifically stress-tested against this exact failure shape:
+  1. **Most severe**: the allergy-conflict HARD STOP's "already mentioned"
+     check used bare `"conflict"`, which collides with unrelated uses (`"a
+     scheduling conflict"`, `"the two records conflict on her DOB"`) and
+     *silently* skips the HARD STOP append -- no verification note, no
+     signal to the resident at all. This is the exact mechanism
+     ARCHITECTURE.md 3.2 calls "a wall, not a request"; a silent false
+     match undermines that claim. Fixed with
+     `_mentions_conflict_near_medication` -- drops bare `"conflict"` and
+     checks the remaining safe cues in a window around the specific
+     medication mention, not the whole response, so an unrelated
+     "conflict" elsewhere (or a different drug's allergy mention in a
+     multi-medication response) can't satisfy it.
+  2. `_DUPLICATE_CUES` (`_enforce_duplicate_and_empty_chart`, production
+     enforcement, not an eval check): bare `"two records"`/`"another
+     record"`/`"multiple records"` collided with unrelated mentions
+     (`"multiple records of prior vaccinations"`), silently skipping the
+     duplicate-patient-record caveat -- the exact "never silently drop"
+     guarantee `c4_7_explicit_suppress_request`'s own `guards_against`
+     text describes. Fixed with `_mentions_duplicate_warning`: narrowed
+     cues to patient/chart/record-specific phrasing, plus a direct check
+     for the literal `other_patient_id` (a UUID has effectively zero
+     collision risk).
+  3. `_EMPTY_CHART_CUES`, same function: bare `"no problems"`/`"no
+     medications"` collided with unrelated uses (`"no problems accessing
+     this data"`), silently skipping the empty-chart caveat that exists
+     specifically so an empty chart is never presented as reassuring
+     (ARCHITECTURE.md Section 4). Fixed with `_mentions_empty_chart`: a
+     few highly specific standalone phrases stay as bare substrings, and
+     the generic "no X" shapes were replaced with a structural pattern
+     requiring "no"/"none" to actually be followed by "recorded"/
+     "documented"/"on file"/"noted" -- catches compound phrasings ("no
+     conditions, medications, or allergies are recorded") a narrower,
+     more literal fix would have missed.
+
+  All three share the same risk shape as `_LAB_VALUE_RE`'s bugs but are
+  arguably worse: 1-3 fail **silently** (no verification note, nothing
+  visibly different in the response), where the earlier `_LAB_VALUE_RE`/
+  `_DOSE_RE`-class bugs at least leave a `[Verification note: I removed N
+  detail(s)...]` marker that something was stripped, even if the reason
+  was spurious. Each fix has its own dedicated regression test in
+  `evals/unit_tests.py` (below), each asserting both directions: the
+  false-positive scenario no longer silences the safety append, and a
+  genuine self-correction still doesn't get a redundant one. Full Golden
+  Set re-run clean after landing (18/18, gate PASS) to confirm touching
+  this core production logic didn't regress anything else.
 
 ## Unit-tier invariant checks (`evals/unit_tests.py`)
 
@@ -564,3 +618,6 @@ in test-runner output:
 | `test_shift_summary_reports_nothing_gathered_yet` | boundary | UC4's other honest-failure condition (companion to `shift_summary_empty_honest_report` in `evals/cases.py`): `summarize_shift_events` must report `data_gathered=False`, scoped per-patient, when nothing has been fetched for this patient yet this conversation -- a Python-level contract, tested here rather than via an LLM message since a compliant model should rarely hit this path naturally. |
 | `test_lab_value_grounding_tolerates_formatting` | regression | Added after a live bug during `compare_signout_to_chart`'s build: `_LAB_VALUE_RE`'s candidate detection extracted a real temperature value the model wrote as "38.9°C", but grounding stored it as "38.9 C" -- an exact-substring mismatch stripped a true, tool-sourced fact. At the time this was only verified with a one-off interactive check, not a permanent test; this closes that gap. Confirms both the equivalence (real value survives despite formatting) and the control (a genuinely different value is still caught, not swept in by the same normalization). |
 | `test_lab_value_range_mention_not_flagged` | regression | Second live bug, found on the very next full-suite run after the fix above landed: `_LAB_VALUE_RE` also caught the upper bound of a stated reference range ("normal range (~3.5-5.0 mEq/L)") and stripped it as an unverified claim, even though a reference range is general medical knowledge, not a claim about the patient -- this one was a real production regression in `verification.py`, not just an eval-case check. Fixed with `_LAB_VALUE_RANGE_PREFIX_RE`, which excludes a value that's the second half of an "X-Y unit" range from candidacy. Confirms the reference-range mention survives untouched, and the control that a genuinely fabricated value elsewhere in the same response is still caught. |
+| `test_allergy_hard_stop_not_silenced_by_unrelated_conflict_word` | regression | Most severe of three bugs found in a systematic audit of every regex/substring-match mechanism in `verification.py`, prompted by the two `_LAB_VALUE_RE` bugs above: the allergy-conflict HARD STOP's "already mentioned" check used a bare "conflict" substring, colliding with unrelated uses ("a scheduling conflict") and *silently* skipping the append -- no verification note, no signal to the resident at all, exactly what ARCHITECTURE.md 3.2 calls this mechanism a "wall" to prevent. Fixed with `_mentions_conflict_near_medication`, checking safe cues in a window around the specific medication mention rather than the whole response. Confirms the false positive no longer silences the HARD STOP, and a genuine self-correction still doesn't get a redundant one appended. |
+| `test_duplicate_warning_not_silenced_by_unrelated_records_mention` | regression | Second of the three, same audit, same severity class: bare "two records"/"multiple records" collided with unrelated mentions ("multiple records of prior vaccinations"), silently skipping the duplicate-patient-record caveat -- the exact "never silently drop" guarantee `c4_7_explicit_suppress_request`'s own `guards_against` text describes. Fixed with `_mentions_duplicate_warning`, requiring patient/chart/record-specific phrasing or the literal `other_patient_id`. |
+| `test_empty_chart_caveat_not_silenced_by_unrelated_no_problems_mention` | regression | Third of the three: bare "no problems"/"no medications" collided with unrelated uses ("no problems accessing this data"), silently skipping the empty-chart caveat. Fixed with `_mentions_empty_chart`, keeping a few specific standalone phrases and replacing the generic ones with a structural "no/none ... recorded/documented/on file/noted" pattern -- catches compound phrasings ("no conditions, medications, or allergies are recorded") that a narrower fix would have missed. |

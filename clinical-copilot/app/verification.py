@@ -37,6 +37,7 @@ from app.fhir_client import FhirClient
 from app.schemas import (
     CheckAllergyConflictOutput,
     CompareSignoutToChartOutput,
+    DuplicatePatientWarning,
     GetPatientSnapshotOutput,
     GetRecentEncountersOutput,
     GetRecentObservationsOutput,
@@ -146,10 +147,58 @@ def _is_grounded(term: str, grounded: set[str]) -> bool:
         return True
     return False
 
-_EMPTY_CHART_CUES = ["no recorded", "nothing recorded", "no problems", "no medications",
-                      "no allergies", "empty chart", "no active problems"]
-_DUPLICATE_CUES = ["duplicate", "another record", "two records", "more than one record",
-                    "two matching", "multiple records"]
+# Fixed 2026-09-18, found live via audit: bare "no problems"/"no
+# medications" collided with unrelated uses ("no problems accessing this
+# data"), silently suppressing the empty-chart safety caveat below --
+# _enforce_duplicate_and_empty_chart is production enforcement, not an
+# eval check, so a false match here means the hard "never present empty
+# as reassuring" guarantee silently doesn't fire. Fixed two ways: a few
+# highly specific standalone phrases stay as bare substrings (low
+# collision risk), and the generic "no X" shapes are replaced with a
+# structural pattern requiring "no"/"none" to actually be followed by
+# "recorded"/"documented"/"on file"/"noted" within a short window --
+# catches real phrasings ("no conditions, medications, or allergies are
+# recorded", "Conditions: none recorded") while excluding "no problems
+# accessing this data", which mentions none of those words at all.
+_EMPTY_CHART_CUES = ["empty chart", "chart is empty", "essentially empty", "genuinely empty",
+                      "no active problems"]
+_EMPTY_CHART_RECORDED_RE = re.compile(
+    r"\b(?:no|none)\b.{0,60}?\b(?:recorded|documented|on file|noted)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _mentions_empty_chart(response: str) -> bool:
+    lowered = response.lower()
+    if any(cue in lowered for cue in _EMPTY_CHART_CUES):
+        return True
+    return bool(_EMPTY_CHART_RECORDED_RE.search(response))
+
+
+# Fixed 2026-09-18, same audit, same risk shape and same severity: bare
+# "two records"/"another record"/"multiple records" collided with
+# unrelated mentions ("multiple records of prior vaccinations"), silently
+# suppressing the duplicate-patient-record warning -- the exact "never
+# silently drop" guarantee c4_7_explicit_suppress_request's own
+# guards_against text describes. Narrowed to phrases that tie the
+# duplicate/matching language to the patient/chart/record context
+# specifically, rather than any generic "records" mention; the literal
+# other_patient_id is also checked directly (see _mentions_duplicate_
+# warning below) since a UUID has effectively zero collision risk.
+_DUPLICATE_CUES = [
+    "duplicate patient", "duplicate record", "duplicate chart", "duplicate-record",
+    "possible duplicate", "duplicate warning", "another patient record",
+    "two patient records", "matching patient record", "matches on name",
+    "matched on name", "matching on name", "same name and birthdate",
+    "same name + birthdate", "flagged a duplicate", "flagged another patient",
+]
+
+
+def _mentions_duplicate_warning(response: str, warnings: list[DuplicatePatientWarning]) -> bool:
+    lowered = response.lower()
+    if any(w.other_patient_id.lower() in lowered for w in warnings):
+        return True
+    return any(cue in lowered for cue in _DUPLICATE_CUES)
 
 
 @dataclass
@@ -292,6 +341,34 @@ def _check_source_attribution(
     return final, unverified
 
 
+# Fixed 2026-09-18, found live via audit, the most severe of the three:
+# bare "conflict" collided with unrelated uses ("a scheduling conflict",
+# "the two records conflict on her DOB") -- ARCHITECTURE.md 3.2 calls this
+# mechanism "a wall, not a request", and a false match here silently skips
+# appending the HARD STOP override, no signal to the resident at all.
+# "conflict" alone is dropped; the remaining safe cues ("allerg",
+# "contraindicat", "do not give", or the specific matched allergy text)
+# are checked in a window around each mention of the medication itself,
+# not the whole response -- so an unrelated "conflict" elsewhere (e.g.
+# about duplicate-record data) can't satisfy this, and a multi-medication
+# response can't have one drug's allergy mention satisfy a different
+# drug's check.
+_CONFLICT_SAFE_CUES = ["allerg", "contraindicat", "do not give"]
+
+
+def _mentions_conflict_near_medication(response: str, medication: str, matched_allergy_text: str | None, window: int = 200) -> bool:
+    lowered = response.lower()
+    med_lower = medication.lower()
+    safe_cues = _CONFLICT_SAFE_CUES + ([matched_allergy_text.lower()] if matched_allergy_text else [])
+    idx = lowered.find(med_lower)
+    while idx != -1:
+        window_text = lowered[max(0, idx - window) : idx + len(med_lower) + window]
+        if any(cue in window_text for cue in safe_cues):
+            return True
+        idx = lowered.find(med_lower, idx + 1)
+    return False
+
+
 def _check_domain_constraint(
     draft_response: str,
     grounded_records: list[ToolCallRecord],
@@ -315,9 +392,7 @@ def _check_domain_constraint(
         if not isinstance(result, CheckAllergyConflictOutput):
             continue  # tool failure here is logged separately by the caller
         if result.conflict_found:
-            mentions_conflict = any(
-                cue in response.lower() for cue in ["allerg", "conflict", "do not give", "contraindicat"]
-            )
+            mentions_conflict = _mentions_conflict_near_medication(response, med, result.matched_allergy_text)
             if not mentions_conflict:
                 passed = False
                 confidence_note = " (based on an uncoded/narrative allergy entry, lower confidence)" if result.low_confidence else ""
@@ -334,12 +409,11 @@ def _enforce_duplicate_and_empty_chart(
     response: str, grounded_records: list[ToolCallRecord]
 ) -> tuple[str, list[str]]:
     enforced = []
-    lowered = response.lower()
     for rec in grounded_records:
         if not isinstance(rec.output, GetPatientSnapshotOutput):
             continue
         snap = rec.output
-        if snap.duplicate_warnings and not any(cue in lowered for cue in _DUPLICATE_CUES):
+        if snap.duplicate_warnings and not _mentions_duplicate_warning(response, snap.duplicate_warnings):
             other_ids = ", ".join(w.other_patient_id for w in snap.duplicate_warnings)
             response += (
                 f"\n\n[Verification note: there are {len(snap.duplicate_warnings)} other "
@@ -348,15 +422,13 @@ def _enforce_duplicate_and_empty_chart(
                 f"they're the same visit or that data hasn't diverged between them.]"
             )
             enforced.append("duplicate_patient")
-            lowered = response.lower()
-        if snap.chart_is_empty and not any(cue in lowered for cue in _EMPTY_CHART_CUES):
+        if snap.chart_is_empty and not _mentions_empty_chart(response):
             response += (
                 "\n\n[Verification note: this patient's chart has no recorded problems, "
                 "medications, or allergies -- that's an empty/incomplete chart, not "
                 "confirmation there's nothing to report.]"
             )
             enforced.append("empty_chart")
-            lowered = response.lower()
     return response, enforced
 
 

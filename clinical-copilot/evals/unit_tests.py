@@ -27,6 +27,7 @@ from app.config import get_settings
 from app.fhir_client import FhirClient
 from app.schemas import (
     CheckAllergyConflictOutput,
+    DuplicatePatientWarning,
     GetPatientSnapshotOutput,
     GetRecentObservationsOutput,
     ObservationFact,
@@ -286,6 +287,126 @@ def test_lab_value_range_mention_not_flagged(fhir: FhirClient) -> tuple[bool, st
     return True, "a reference-range mention survives untouched, and a genuinely fabricated value elsewhere is still caught"
 
 
+def test_allergy_hard_stop_not_silenced_by_unrelated_conflict_word(fhir: FhirClient) -> tuple[bool, str]:
+    """Regression test for the most severe of three bugs found in a
+    systematic audit (2026-09-18) of every regex/substring-match mechanism
+    in verification.py, prompted after the two _LAB_VALUE_RE bugs: the
+    domain-constraint HARD STOP's "already mentioned" check used a bare
+    "conflict" substring cue, which collides with unrelated uses ("a
+    scheduling conflict", "the two records conflict on her DOB") --
+    confirmed live via audit before this fix. Silently skipping the HARD
+    STOP append is exactly what ARCHITECTURE.md 3.2 calls this mechanism a
+    "wall" specifically to prevent; a false match here means no signal at
+    all reaches the resident. Fixed by dropping bare "conflict" and
+    checking the remaining safe cues in a window around the specific
+    medication mention, not the whole response
+    (_mentions_conflict_near_medication).
+
+    Uses pid1's real, documented penicillin allergy (same fixture as
+    test_domain_constraint_backstop_survives_missing_patient_id) so the
+    conflict is genuine, not a stub.
+    """
+    snapshot = get_patient_snapshot(fhir, {"patient_id": f.PID1_ALICE}, [])
+    if not isinstance(snapshot, GetPatientSnapshotOutput):
+        return False, f"setup failed: couldn't fetch pid1 snapshot ({snapshot})"
+    record = ToolCallRecord(tool_name="get_patient_snapshot", patient_id=f.PID1_ALICE, output=snapshot)
+
+    unrelated_conflict_draft = (
+        "There is a scheduling conflict for tomorrow's follow-up that the resident should know "
+        "about. Penicillin should be fine to give for this infection."
+    )
+    outcome = verify_response(unrelated_conflict_draft, [record], f.PID1_ALICE, fhir)
+    if outcome.passed_domain_constraint:
+        return False, (
+            "an unrelated mention of 'conflict' (a scheduling conflict) incorrectly satisfied "
+            "the allergy-conflict check and silenced the HARD STOP for a real penicillin conflict"
+        )
+    if "HARD STOP" not in outcome.final_response:
+        return False, "expected a [HARD STOP] warning injected for the real, documented penicillin conflict"
+
+    already_stated_draft = "She has a documented penicillin allergy, so penicillin should not be given."
+    already_stated_outcome = verify_response(already_stated_draft, [record], f.PID1_ALICE, fhir)
+    if "HARD STOP" in already_stated_outcome.final_response:
+        return False, "a response that already correctly stated the conflict should not get a redundant HARD STOP appended"
+
+    return True, "an unrelated 'conflict' mention no longer silences the HARD STOP, and a genuine self-correction is still respected"
+
+
+def test_duplicate_warning_not_silenced_by_unrelated_records_mention(fhir: FhirClient) -> tuple[bool, str]:
+    """Regression test for the second of three bugs from the same audit:
+    the duplicate-patient-record caveat's "already mentioned" check used
+    bare substrings like "two records"/"multiple records", which collide
+    with unrelated mentions ("multiple records of prior vaccinations") --
+    confirmed live via audit. This is the exact "never silently drop"
+    guarantee c4_7_explicit_suppress_request's own guards_against text
+    describes; a false match here silently skips the caveat entirely.
+    Fixed by requiring the duplicate/matching language to be tied to the
+    patient/chart/record context specifically, or by checking the literal
+    other_patient_id directly (_mentions_duplicate_warning).
+    """
+    snapshot = GetPatientSnapshotOutput(
+        patient_id=f.PID1_ALICE, name="Alice Testpatient", birth_date="1972-03-14", gender="female",
+        conditions=[], medications=[], allergies=[], chart_is_empty=False,
+        duplicate_warnings=[DuplicatePatientWarning(other_patient_id="fixture-other-id-1", matched_on="name+birthdate")],
+        partial_failures=[],
+    )
+    record = ToolCallRecord(tool_name="get_patient_snapshot", patient_id=f.PID1_ALICE, output=snapshot)
+
+    unrelated_records_draft = "Her chart shows multiple records of prior vaccinations. She has type 2 diabetes."
+    outcome = verify_response(unrelated_records_draft, [record], f.PID1_ALICE, fhir)
+    if "duplicate_patient" not in outcome.enforced_warnings:
+        return False, (
+            "an unrelated mention of 'multiple records' (vaccination history) incorrectly "
+            "satisfied the duplicate-warning check and silenced the caveat for a real duplicate "
+            f"patient record, got enforced_warnings={outcome.enforced_warnings}"
+        )
+
+    already_stated_draft = (
+        "Possible duplicate record: this patient matches on name + birthdate with another "
+        "patient record."
+    )
+    already_stated_outcome = verify_response(already_stated_draft, [record], f.PID1_ALICE, fhir)
+    if "duplicate_patient" in already_stated_outcome.enforced_warnings:
+        return False, "a response that already correctly stated the duplicate should not get a redundant caveat appended"
+
+    return True, "an unrelated 'records' mention no longer silences the duplicate caveat, and a genuine self-correction is still respected"
+
+
+def test_empty_chart_caveat_not_silenced_by_unrelated_no_problems_mention(fhir: FhirClient) -> tuple[bool, str]:
+    """Regression test for the third of three bugs from the same audit:
+    the empty-chart caveat's "already mentioned" check used bare
+    substrings like "no problems"/"no medications", which collide with
+    unrelated uses ("no problems accessing this data") -- confirmed live
+    via audit. A false match here silently skips the caveat that exists
+    specifically so an empty chart never gets presented as reassuring
+    (ARCHITECTURE.md Section 4). Fixed by keeping a few highly specific
+    standalone phrases and replacing the generic ones with a structural
+    pattern requiring "no"/"none" to actually be followed by "recorded"/
+    "documented"/"on file"/"noted" (_mentions_empty_chart).
+    """
+    snapshot = GetPatientSnapshotOutput(
+        patient_id=f.PID3_CAROL, name="Carol Emptychart", birth_date="1990-07-21", gender="female",
+        conditions=[], medications=[], allergies=[], chart_is_empty=True,
+        duplicate_warnings=[], partial_failures=[],
+    )
+    record = ToolCallRecord(tool_name="get_patient_snapshot", patient_id=f.PID3_CAROL, output=snapshot)
+
+    unrelated_draft = "I had no problems accessing this data for the patient."
+    outcome = verify_response(unrelated_draft, [record], f.PID3_CAROL, fhir)
+    if "empty_chart" not in outcome.enforced_warnings:
+        return False, (
+            "an unrelated mention of 'no problems' (data access) incorrectly satisfied the "
+            f"empty-chart check and silenced the caveat, got enforced_warnings={outcome.enforced_warnings}"
+        )
+
+    already_stated_draft = "This chart shows no conditions, medications, or allergies are recorded."
+    already_stated_outcome = verify_response(already_stated_draft, [record], f.PID3_CAROL, fhir)
+    if "empty_chart" in already_stated_outcome.enforced_warnings:
+        return False, "a response that already correctly described the empty chart should not get a redundant caveat appended"
+
+    return True, "an unrelated 'no problems' mention no longer silences the empty-chart caveat, and a genuine self-correction is still respected"
+
+
 # --- (c) app/sensitivity.py -- pure functions, no FHIR/network needed at all,
 # but kept in this LLM-free suite (not evals/cases.py) since they need no
 # model call either. Phase 1's empirical finding this guards: a real
@@ -458,6 +579,9 @@ TESTS: list[tuple[str, Callable[[FhirClient], tuple[bool, str]]]] = [
     ("verification_passes_grounded_claim", test_verification_passes_grounded_claim),
     ("lab_value_grounding_tolerates_formatting", test_lab_value_grounding_tolerates_formatting),
     ("lab_value_range_mention_not_flagged", test_lab_value_range_mention_not_flagged),
+    ("allergy_hard_stop_not_silenced_by_unrelated_conflict_word", test_allergy_hard_stop_not_silenced_by_unrelated_conflict_word),
+    ("duplicate_warning_not_silenced_by_unrelated_records_mention", test_duplicate_warning_not_silenced_by_unrelated_records_mention),
+    ("empty_chart_caveat_not_silenced_by_unrelated_no_problems_mention", test_empty_chart_caveat_not_silenced_by_unrelated_no_problems_mention),
     ("sensitivity_filter_excludes_high_for_clin", test_sensitivity_filter_excludes_high_for_clin),
     ("sensitivity_filter_allows_high_for_doc", test_sensitivity_filter_allows_high_for_doc),
     ("domain_constraint_backstop_survives_missing_patient_id", test_domain_constraint_backstop_survives_missing_patient_id),
