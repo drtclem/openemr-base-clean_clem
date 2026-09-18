@@ -154,6 +154,32 @@ properly coded field. How often real OpenEMR data is uncoded, and therefore how 
 fallback path is actually exercised, is unmeasured, this is called out as an open risk, not
 assumed to be rare.
 
+**UC4 addition (`summarize_shift_events`), 2026-09-18 — an honest, explicitly non-load-bearing
+exception, not a correctness mechanism:** `SYSTEM_PROMPT` instructs the model to call
+`summarize_shift_events` before drafting a shift-handoff summary, rather than synthesizing one
+directly from what it already has in context. Examined directly, not assumed, before writing this
+paragraph: **this rule does not change what `verify_response()` catches.** `_grounded_vocabulary()`
+builds its vocabulary from the turn's full accumulated `ToolCallRecord` list regardless of which
+tools ran, so a medication/condition/allergy/encounter/observation-shaped fact is grounded whether
+the model routes through `summarize_shift_events` or drafts directly from the same underlying
+records. A duplicate-record warning isn't grounded via this mechanism in either path (it's
+enforced separately, by `_enforce_duplicate_and_empty_chart`). And an event-shaped claim outside
+`_ALL_TERMS`'s medication/allergy/condition vocabulary (e.g. "transferred to the ICU") is never
+even considered a candidate needing grounding in the first place, by either path — the same
+scannable-vocabulary gap documented for `get_recent_observations` above and in
+`clinical-copilot/evals/behavioral_coverage.py`'s module docstring.
+
+So what the rule actually is: a prompt-level nudge toward a deterministic aggregation checkpoint,
+kept for auditability and future extensibility (a stable, inspectable `ToolCallRecord` for "what
+was staged for this summary," and a concrete point a future, stricter rule could hook into — e.g.
+"the shift-summary section may only restate `events` from this record" — which nothing enforces
+today), not a §3.2-style wall. Unlike `check_allergy_conflict`, this is not "structurally impossible
+to route around" — it's a request the model can still reason past, and empirically did on the first
+live test of the weaker initial wording (it synthesized an accurate summary directly from context
+without ever calling the tool). Strengthened to an explicit imperative afterward, but strengthened
+wording is still wording: nothing here is a code-level guarantee. Documented explicitly so this
+isn't later mistaken for the same category of protection §3.2 describes.
+
 ## 3.2 Domain constraint enforcement
 
 A small set of rules-based checks run independently of the model's own reasoning, not as a prompt
