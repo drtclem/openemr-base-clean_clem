@@ -247,10 +247,10 @@ collection was committed.
   caught. Documented in `app/tools.py` and `ARCHITECTURE.md` 3.2.
 - **Conversation state is in-memory**, single-process. Fine for this demo,
   not for more than one server instance.
-- Only the two tools in scope for Early Submission are implemented
-  (`get_patient_snapshot`, `check_allergy_conflict`) -- `get_recent_encounters`,
-  `get_recent_observations`, `compare_signout_to_chart`, `summarize_shift_events`
-  are not built yet, per the build prompt's explicit scope cut.
+- Five tools are implemented: the two in scope for Early Submission
+  (`get_patient_snapshot`, `check_allergy_conflict`), plus `get_recent_encounters`
+  (Phase 6, UC2), `get_recent_observations` (UC2), and `summarize_shift_events`
+  (UC4), added afterward. `compare_signout_to_chart` is not built yet.
 - No `/health` / `/ready`, no Bruno collection, no load tests, no alerts --
   all explicitly deferred to Final Submission per the build prompt.
 - **`/chat` on the droplet (port 8420) no longer has the open, no-auth

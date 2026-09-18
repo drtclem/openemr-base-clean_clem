@@ -39,8 +39,10 @@ from app.schemas import (
     GetPatientSnapshotOutput,
     GetRecentEncountersOutput,
     GetRecentObservationsOutput,
+    SummarizeShiftEventsOutput,
 )
-from app.tools import check_allergy_conflict
+from app.tools import ToolCallRecord, check_allergy_conflict  # noqa: F401 -- ToolCallRecord re-exported,
+# see its docstring in app/tools.py for why it lives there now, not here
 
 # Curated clinical-term vocabulary used ONLY to decide "this looks like a
 # claim worth checking" -- not to prove correctness. Deliberately modest;
@@ -99,13 +101,6 @@ _DUPLICATE_CUES = ["duplicate", "another record", "two records", "more than one 
 
 
 @dataclass
-class ToolCallRecord:
-    tool_name: str
-    patient_id: str
-    output: object  # GetPatientSnapshotOutput | CheckAllergyConflictOutput
-
-
-@dataclass
 class VerificationOutcome:
     passed_source_attribution: bool
     passed_domain_constraint: bool
@@ -160,6 +155,17 @@ def _grounded_vocabulary(records: list[ToolCallRecord]) -> set[str]:
                 vocab.add(obs.text.lower())
                 if obs.value:
                     vocab.add(obs.value.lower())
+        elif isinstance(rec.output, SummarizeShiftEventsOutput):
+            # UC4: mostly redundant with the branches above, since the
+            # underlying GetPatientSnapshotOutput/GetRecentEncountersOutput/
+            # GetRecentObservationsOutput records this tool read from are
+            # still in turn_records themselves and already grounded their
+            # own text. Grounded anyway, defense in depth, and because the
+            # duplicate-record event text is newly synthesized here (not a
+            # verbatim field on any underlying Fact) -- without this branch
+            # that specific phrasing wouldn't be grounded by anything else.
+            for event in rec.output.events:
+                vocab.add(event.text.lower())
     return vocab
 
 

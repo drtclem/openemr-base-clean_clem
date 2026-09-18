@@ -10,7 +10,7 @@
   (`get_patient_snapshot`, `check_allergy_conflict`) and `verification.py`'s
   stripping logic, independent of whether the model behaves well on any
   given day. Free and instant, so there's no reason not to run it constantly.
-- **`evals/cases.py`** (the 14 cases below) -- exercises the agent's actual
+- **`evals/cases.py`** (the 16 cases below) -- exercises the agent's actual
   LLM behavior, real Anthropic calls, costs real spend per run. Triggered
   manually / before deploys (`python3 -m evals.run_evals`), not on every
   commit.
@@ -24,7 +24,7 @@ verification change).
 
 ## Golden Set vs. Behavioral Coverage
 
-The current 14 LLM-based cases in `evals/cases.py` are, by definition, a
+The current 16 LLM-based cases in `evals/cases.py` are, by definition, a
 **Golden Set**: small, every case expected to pass, correctness-focused --
 each one pins down a specific known fact, invariant, or prior finding, and a
 failure means something genuinely broke. This is deliberately not yet
@@ -178,7 +178,7 @@ worthwhile, following the same process (read real traces, name failure
 modes in plain language, then cluster), not by inventing more cases from a
 checklist.
 
-**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 14 cases
+**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 16 cases
 as a persisted Langfuse Dataset (one item per case, keyed by case name for
 idempotent re-creation) so pass-rate history becomes a visible trend across
 runs in the Langfuse UI (Datasets/Experiments in the sidebar), not just a
@@ -223,6 +223,8 @@ is a synthesis/formatting pass over what's already there, not new analysis.
 | `oauth_scope_enforcement_denied` | invariant | -- (Phase 1 auth invariant, not a USERS.md clinical use case) | CLAUDE_CODE_BUILD_INSTRUCTIONS.md Phase 1 + ARCHITECTURE.md 1.3 (a token's granted OAuth scope must actually bound what it can fetch) |
 | `observations_missing_honest_report` | boundary | 2 (verify a sign-out instruction against the current chart -- `get_recent_observations` is how the resident checks a conditional lab/vital claim) | UC2 (USERS.md): a real search returning zero observations must be reported honestly, never fabricated or presented as reassuring -- same honest-failure pattern as `pid3_empty_chart`/`malformed_patient_id`, isolated to the empty-result path specifically |
 | `observation_value_reaches_response_accurately` | invariant | 2 (verify a sign-out instruction against the current chart) | UC2 (USERS.md): a real, current observation value must reach the resident accurately -- a conditional sign-out instruction ("if potassium is high, give X") is only checkable against a correctly-reported value. Uses a controlled fixture, not live data (see the case's own docstring); note that "potassium" isn't in `verification.py`'s scannable vocabulary, so this tests the model's own accuracy, not the structural safety net -- see Known Scenario Gaps below |
+| `shift_summary_empty_honest_report` | boundary | 4 (end-of-shift summary handoff -- `summarize_shift_events` is how the agent synthesizes what it already gathered into a handoff) | UC4 (USERS.md): a shift with zero notable events must produce an honest "nothing notable" rather than fabricated filler. Exercised against pid3's real, live empty chart, not a stub. |
+| `shift_summary_no_fabrication` | invariant | 4 (end-of-shift summary handoff) | UC4 (USERS.md): a shift-handoff summary must never state anything not present in the source data it's summarizing from -- baits with a plausible-but-absent overnight event (ICU transfer, code status change) against a fully-known controlled fixture and confirms it never appears. |
 
 USERS.md use-case mapping note: where a case's `guards_against` text doesn't
 name a use case explicitly, the mapping above follows ARCHITECTURE.md
@@ -233,11 +235,15 @@ cases 1, 2, 4, though the case here specifically exercises **use case 2**,
 what sign-out claims to what actually happened since requires exactly the
 recent-encounter history this tool provides; `get_recent_observations` ->
 same use cases as `get_recent_encounters`, for the same reason but for
-labs/vitals rather than visit history) plus the case's own message
-content. No case here exercises use case 4 (end-of-shift summary) --
-consistent with USERS.md itself flagging that as lower-priority, build-only-
-if-time-allows. `oauth_scope_enforcement_denied` is the one exception to
-this mapping scheme entirely: it's an auth-layer invariant (Phase 1,
+labs/vitals rather than visit history; `summarize_shift_events` -> **use
+case 4 specifically**, "end-of-shift summary handoff back to the primary
+day team" -- the one tool that exists purely for that use case, not a
+byproduct mapping the way the other three are) plus the case's own message
+content. Use case 4 previously had no case at all here (USERS.md itself
+flags it as lower-priority, build-only-if-time-allows) -- now covered by
+the two `shift_summary_*` cases above. `oauth_scope_enforcement_denied` is
+the one exception to this mapping scheme entirely: it's an auth-layer
+invariant (Phase 1,
 `CLAUDE_CODE_BUILD_INSTRUCTIONS.md`), not a clinical use case, so it has no
 USERS.md mapping by design, not by omission.
 
@@ -402,6 +408,41 @@ silently absent:
   expanding `_ALL_TERMS` to cover lab/vitals is a verification-layer
   change that deserves its own review, not a silent addition riding along
   with a new tool.
+- **NEW, 2026-09-18: `summarize_shift_events` (UC4) is different in kind
+  from every other tool -- discovered and worked through during design,
+  not after.** It makes no FHIR call and takes no `fhir` client; it reads
+  `ToolCallRecord`s already accumulated this conversation instead.
+  `ToolCallRecord` moved from `app/verification.py` to `app/tools.py`
+  (re-exported from `verification.py` for backward compatibility) to
+  avoid a circular import, since this tool needed it too and
+  `verification.py` already imports from `tools.py`. `_call_tool`
+  (`app/agent.py`) special-cases this tool's dispatch by name rather than
+  forcing a `fhir`-shaped signature onto it -- commented the same way
+  `_RESIDENT_ROLE`'s exception is (`app/tools.py`). The tool itself is
+  purely deterministic aggregation, no generation inside it -- the actual
+  narrative synthesis happens in the main model turn, same as every other
+  tool, so it still passes through `verify_response()`'s existing
+  grounding check with no new verification machinery needed (a nested LLM
+  call inside a tool would draft text nothing in this architecture ever
+  checks). Because the compensating sensitivity filter already ran inside
+  `get_recent_encounters` before its output ever reached a
+  `ToolCallRecord`, a filtered-out encounter is structurally absent from
+  what this tool reads -- confirmed, not assumed, and true only because
+  this tool has no FHIR access of its own.
+
+  **Also caught live, first run**: the initial `SYSTEM_PROMPT` nudge
+  ("first make sure you've gathered... if you haven't already") wasn't
+  imperative enough -- the model correctly gathered `get_patient_snapshot`/
+  `get_recent_encounters`/`get_recent_observations`, then synthesized an
+  accurate shift summary directly from its own context without ever
+  calling `summarize_shift_events` at all. Reasonable model behavior (it
+  already had everything it needed), but it meant the dedicated tool's own
+  structured output -- and the fresh `ToolCallRecord`/grounding checkpoint
+  it provides -- was never actually exercised. Fixed by strengthening the
+  rule to an explicit "THEN call summarize_shift_events... do not
+  synthesize it yourself directly, even if you could," verified against
+  both new cases afterward; response quality and clinical content were
+  unaffected by the added tool-call round.
 
 ## Unit-tier invariant checks (`evals/unit_tests.py`)
 
@@ -417,3 +458,4 @@ in test-runner output:
 | `test_cross_patient_tool_call_blocked` | invariant | A tool call's `patient_id` must match the conversation's declared active patient before the real FHIR read executes -- previously unenforced, an agent-mediated IDOR (`THREAT_MODEL.md` 4.2, fixed commit `ff18c21`). |
 | `test_check_allergy_conflict_cross_reactive` | invariant | `check_allergy_conflict` must flag amoxicillin against pid1's documented penicillin allergy via the curated drug-class table (`app/clinical_reference.py`, Phase 5), not only a direct/substring name match. |
 | `test_check_allergy_conflict_cross_reactive_scoped_to_curated_classes` | invariant | The cross-reactivity table must not over-fire outside its curated scope -- a medication in no curated class and not a direct match (metformin) must still report no conflict. |
+| `test_shift_summary_reports_nothing_gathered_yet` | boundary | UC4's other honest-failure condition (companion to `shift_summary_empty_honest_report` in `evals/cases.py`): `summarize_shift_events` must report `data_gathered=False`, scoped per-patient, when nothing has been fetched for this patient yet this conversation -- a Python-level contract, tested here rather than via an LLM message since a compliant model should rarely hit this path naturally. |

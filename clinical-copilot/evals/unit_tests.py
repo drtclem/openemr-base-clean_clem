@@ -25,9 +25,14 @@ from app.agent import ClinicalCopilotAgent
 from app.auth import OAuthTokenProvider
 from app.config import get_settings
 from app.fhir_client import FhirClient
-from app.schemas import CheckAllergyConflictOutput, GetPatientSnapshotOutput, ToolFailure
+from app.schemas import (
+    CheckAllergyConflictOutput,
+    GetPatientSnapshotOutput,
+    SummarizeShiftEventsOutput,
+    ToolFailure,
+)
 from app.sensitivity import filter_encounters_by_sensitivity, has_high_sensitivity_clearance
-from app.tools import check_allergy_conflict, get_patient_snapshot
+from app.tools import check_allergy_conflict, get_patient_snapshot, summarize_shift_events
 from app.verification import ToolCallRecord, verify_response
 from evals import fixtures as f
 from evals.golden_facts import GOLDEN_FACTS
@@ -267,7 +272,7 @@ def test_cross_patient_tool_call_blocked(fhir: FhirClient) -> tuple[bool, str]:
     """
     agent = ClinicalCopilotAgent(get_settings())
 
-    blocked = agent._call_tool("get_patient_snapshot", {"patient_id": f.PID4_DAN}, fhir, f.PID1_ALICE)
+    blocked = agent._call_tool("get_patient_snapshot", {"patient_id": f.PID4_DAN}, fhir, f.PID1_ALICE, [])
     if not isinstance(blocked, ToolFailure):
         return False, f"expected the mismatched patient_id to be blocked before dispatch, got: {blocked!r}"
     if blocked.detail_code != "patient_mismatch":
@@ -275,9 +280,54 @@ def test_cross_patient_tool_call_blocked(fhir: FhirClient) -> tuple[bool, str]:
 
     # Control: a matching patient_id must still work normally -- this isn't
     # supposed to block all tool calls, only mismatched ones.
-    ok = agent._call_tool("get_patient_snapshot", {"patient_id": f.PID1_ALICE}, fhir, f.PID1_ALICE)
+    ok = agent._call_tool("get_patient_snapshot", {"patient_id": f.PID1_ALICE}, fhir, f.PID1_ALICE, [])
     if not isinstance(ok, GetPatientSnapshotOutput):
         return False, f"a matching patient_id should still succeed normally, got: {ok!r}"
+
+    return True, "cross-patient tool call was blocked before any FHIR read; matching patient_id still works"
+
+
+def test_shift_summary_reports_nothing_gathered_yet(fhir: FhirClient) -> tuple[bool, str]:
+    """UC4 boundary condition, LLM-free by design rather than an eval case:
+    summarize_shift_events' `data_gathered=False` path is a Python-level
+    contract (what does the function return when turn_records has no
+    records for this patient), not really a question of model behavior --
+    a compliant model, following SYSTEM_PROMPT's "gather first" nudge,
+    should rarely if ever hit this path in a real conversation, which
+    makes it an unreliable thing to force via a natural LLM eval message.
+    Testing the tool's own contract directly is both more rigorous and
+    more deterministic for this specific case than trying to coax an LLM
+    into skipping its own gathering step. The companion boundary condition
+    -- data was gathered, and it's genuinely empty (data_gathered=True,
+    events=[]) -- is `shift_summary_empty_honest_report` in evals/cases.py,
+    exercised against pid3's real empty chart; this test is deliberately
+    the other honest-failure condition, not a duplicate of it.
+    """
+    result = summarize_shift_events([], {"patient_id": f.PID1_ALICE})
+    if not isinstance(result, SummarizeShiftEventsOutput):
+        return False, f"expected a SummarizeShiftEventsOutput, got: {result!r}"
+    if result.data_gathered is not False:
+        return False, f"expected data_gathered=False when turn_records has nothing for this patient, got {result.data_gathered!r}"
+    if result.events:
+        return False, f"expected an empty events list when nothing was gathered, got {result.events!r}"
+
+    # Control: a real record for a DIFFERENT patient must not leak in as
+    # "gathered" for this patient -- data_gathered is per-patient, not
+    # "anything exists in turn_records at all".
+    other_patient_record = ToolCallRecord(
+        tool_name="get_patient_snapshot",
+        patient_id=f.PID2_BOB,
+        output=GetPatientSnapshotOutput(
+            patient_id=f.PID2_BOB, name="Bob Testpatient", birth_date=None, gender=None,
+            conditions=[], medications=[], allergies=[], chart_is_empty=True,
+            duplicate_warnings=[], partial_failures=[],
+        ),
+    )
+    scoped_result = summarize_shift_events([other_patient_record], {"patient_id": f.PID1_ALICE})
+    if scoped_result.data_gathered is not False:
+        return False, "a different patient's gathered data incorrectly counted as 'gathered' for this patient"
+
+    return True, "correctly reports data_gathered=False, scoped per-patient, when nothing has been gathered yet"
 
     return True, "cross-patient tool call was blocked before any FHIR read; matching patient_id still works"
 
@@ -295,6 +345,7 @@ TESTS: list[tuple[str, Callable[[FhirClient], tuple[bool, str]]]] = [
     ("sensitivity_filter_allows_high_for_doc", test_sensitivity_filter_allows_high_for_doc),
     ("domain_constraint_backstop_survives_missing_patient_id", test_domain_constraint_backstop_survives_missing_patient_id),
     ("cross_patient_tool_call_blocked", test_cross_patient_tool_call_blocked),
+    ("shift_summary_reports_nothing_gathered_yet", test_shift_summary_reports_nothing_gathered_yet),
 ]
 
 

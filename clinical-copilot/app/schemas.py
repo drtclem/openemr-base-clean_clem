@@ -155,6 +155,42 @@ class GetRecentObservationsOutput(BaseModel):
     partial_failures: list[str] = Field(default_factory=list)
 
 
+# --- summarize_shift_events (UC4, USERS.md) ---------------------------------
+#
+# Different in kind from every tool above: no FHIR call, no `fhir` parameter
+# (see app/tools.py's docstring for the reasoning, and app/agent.py's
+# ClinicalCopilotAgent._call_tool for the dispatch special-case this
+# requires). Synthesizes purely from facts already gathered this
+# conversation -- never fetches anything new, and therefore never needs its
+# own compensating sensitivity filter: whatever app/sensitivity.py already
+# excluded from get_recent_encounters' output was never added to the
+# ToolCallRecord this tool reads in the first place.
+
+
+class SummarizeShiftEventsInput(BaseModel):
+    patient_id: str = Field(..., description="OpenEMR FHIR Patient resource id (UUID).")
+
+
+class ShiftEventFact(BaseModel):
+    text: str
+    category: Literal["condition", "medication", "allergy", "encounter", "observation", "duplicate_warning"]
+    source_resource: str
+
+
+class SummarizeShiftEventsOutput(BaseModel):
+    patient_id: str
+    events: list[ShiftEventFact]
+    data_gathered: bool = Field(
+        ...,
+        description=(
+            "False if nothing has been fetched for this patient yet this conversation -- "
+            "distinct from True with events=[], which means data WAS gathered and there is "
+            "genuinely nothing notable to report. Two different honest-failure conditions, "
+            "not one collapsed empty case."
+        ),
+    )
+
+
 # --- shared tool-failure envelope (ARCHITECTURE.md Section 2, 4) ------------
 
 

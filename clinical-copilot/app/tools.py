@@ -8,6 +8,10 @@ Section 2 table:
 - get_recent_encounters   -> Encounter (Phase 6, sensitivity-filtered -- app/sensitivity.py)
 - get_recent_observations -> Observation (UC2, NOT sensitivity-filtered -- see its own
   docstring below for why that compensating control doesn't apply here)
+- summarize_shift_events  -> UC4, different in kind from the other four: no FHIR call,
+  no `fhir` parameter, takes this conversation's already-accumulated ToolCallRecords
+  instead -- see its own docstring below, and ClinicalCopilotAgent._call_tool's
+  special-case dispatch for it (app/agent.py).
 
 Error handling follows ARCHITECTURE.md Section 2's hard rule: a tool call
 that fails returns a structured ToolFailure the agent must surface directly,
@@ -17,6 +21,7 @@ never silently answered around.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from app.clinical_reference import cross_reactive_class
 from app.fhir_client import FhirClient, FhirRequestError, bundle_entries
@@ -35,12 +40,31 @@ from app.schemas import (
     GetRecentObservationsOutput,
     MedicationFact,
     ObservationFact,
+    ShiftEventFact,
+    SummarizeShiftEventsInput,
+    SummarizeShiftEventsOutput,
     ToolFailure,
 )
 from app.sensitivity import Role, filter_encounters_by_sensitivity
 
 _DATA_ABSENT_SYSTEM = "http://terminology.hl7.org/CodeSystem/data-absent-reason"
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+@dataclass
+class ToolCallRecord:
+    """Defined here, not in app/verification.py (which re-exports it for
+    backward compatibility -- see its import comment), because
+    summarize_shift_events (below) needs it too, and verification.py
+    already imports from tools.py -- the reverse (tools.py importing
+    from verification.py) would be circular. Every real tool call this
+    conversation, in either module, is recorded as one of these; both
+    verify_response()'s grounding and summarize_shift_events' aggregation
+    read the same accumulated list."""
+
+    tool_name: str
+    patient_id: str
+    output: object  # GetPatientSnapshotOutput | CheckAllergyConflictOutput | ...
 
 
 def _strip_html(narrative_div: str) -> str:
@@ -438,3 +462,96 @@ def get_recent_observations(fhir: FhirClient, raw_input: dict) -> GetRecentObser
         )
 
     return GetRecentObservationsOutput(patient_id=params.patient_id, observations=observations)
+
+
+def summarize_shift_events(
+    turn_records: list[ToolCallRecord], raw_input: dict
+) -> SummarizeShiftEventsOutput | ToolFailure:
+    """UC4 (USERS.md): synthesizes a shift-handoff summary purely from facts
+    already gathered THIS conversation (turn_records -- accumulated across
+    both this turn's own tool-call rounds and any earlier turns, see
+    ClinicalCopilotAgent.run_turn's prior_tool_records docstring in
+    app/agent.py). Makes NO new FHIR call and takes NO fhir client, unlike
+    every other tool in this module -- dispatched through a special case in
+    ClinicalCopilotAgent._call_tool, not the uniform impl(fhir, tool_input)
+    pattern the other four share; see that special case's own comment for
+    why (app/agent.py).
+
+    Purely deterministic aggregation, no generation: this function never
+    calls the model. The actual narrative synthesis into shift-summary
+    prose happens the same place every other tool's output becomes prose --
+    the main model turn, whose draft still passes through
+    verify_response()'s existing grounding check. Keeping this tool
+    mechanical means no new verification machinery is needed here; a nested
+    LLM call inside a tool would draft text nothing in this architecture
+    ever checks (verify_response only scans the FINAL response text, never
+    an intermediate tool output).
+
+    Because the compensating sensitivity filter (app/sensitivity.py) already
+    ran inside get_recent_encounters before its output was ever added to
+    turn_records, a filtered-out encounter is structurally absent from what
+    this function reads -- no separate filtering step needed here. That
+    reasoning holds only because this tool has no FHIR access of its own;
+    if it ever gained one, it would need re-verifying, not assuming.
+    """
+    try:
+        params = SummarizeShiftEventsInput.model_validate(raw_input)
+    except Exception:
+        return ToolFailure(
+            tool="summarize_shift_events",
+            reason="I couldn't process that patient reference -- it wasn't a valid patient ID.",
+            detail_code="invalid_input",
+        )
+
+    patient_records = [rec for rec in turn_records if rec.patient_id == params.patient_id]
+    if not patient_records:
+        return SummarizeShiftEventsOutput(patient_id=params.patient_id, events=[], data_gathered=False)
+
+    events: list[ShiftEventFact] = []
+    for rec in patient_records:
+        out = rec.output
+        if isinstance(out, GetPatientSnapshotOutput):
+            for c in out.conditions:
+                events.append(ShiftEventFact(text=c.text, category="condition", source_resource=c.source_resource))
+            for m in out.medications:
+                events.append(ShiftEventFact(text=m.text, category="medication", source_resource=m.source_resource))
+            for a in out.allergies:
+                events.append(ShiftEventFact(text=a.text, category="allergy", source_resource=a.source_resource))
+            for d in out.duplicate_warnings:
+                events.append(
+                    ShiftEventFact(
+                        text=f"Possible duplicate record: {d.other_patient_id} (matched on {d.matched_on})",
+                        category="duplicate_warning",
+                        source_resource=f"Patient/{d.other_patient_id}",
+                    )
+                )
+        elif isinstance(out, GetRecentEncountersOutput):
+            for enc in out.encounters:
+                events.append(ShiftEventFact(text=enc.text, category="encounter", source_resource=enc.source_resource))
+        elif isinstance(out, GetRecentObservationsOutput):
+            for obs in out.observations:
+                text = f"{obs.text}: {obs.value}" if obs.value else obs.text
+                events.append(ShiftEventFact(text=text, category="observation", source_resource=obs.source_resource))
+        elif isinstance(out, CheckAllergyConflictOutput):
+            if out.conflict_found:
+                events.append(
+                    ShiftEventFact(
+                        text=f"Allergy conflict checked and found: {out.medication_name} vs {out.matched_allergy_text}",
+                        category="allergy",
+                        source_resource=(out.source_resources[0] if out.source_resources else "AllergyIntolerance/unknown"),
+                    )
+                )
+
+    # De-dupe by (category, text) -- the same fact can legitimately be
+    # gathered more than once this conversation (e.g. get_patient_snapshot
+    # called in an earlier turn and again in this one), and a shift summary
+    # shouldn't repeat it per gathering call.
+    seen: set[tuple[str, str]] = set()
+    deduped: list[ShiftEventFact] = []
+    for event in events:
+        key = (event.category, event.text.lower())
+        if key not in seen:
+            seen.add(key)
+            deduped.append(event)
+
+    return SummarizeShiftEventsOutput(patient_id=params.patient_id, events=deduped, data_gathered=True)
