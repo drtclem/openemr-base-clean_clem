@@ -34,7 +34,7 @@ import re
 from dataclasses import dataclass, field
 
 from app.fhir_client import FhirClient
-from app.schemas import CheckAllergyConflictOutput, GetPatientSnapshotOutput
+from app.schemas import CheckAllergyConflictOutput, GetPatientSnapshotOutput, GetRecentEncountersOutput
 from app.tools import check_allergy_conflict
 
 # Curated clinical-term vocabulary used ONLY to decide "this looks like a
@@ -129,6 +129,14 @@ def _grounded_vocabulary(records: list[ToolCallRecord]) -> set[str]:
             vocab.add(conf.medication_name.lower())
             if conf.matched_allergy_text:
                 vocab.add(conf.matched_allergy_text.lower())
+        elif isinstance(rec.output, GetRecentEncountersOutput):
+            # Phase 6: an encounter's reason/type text can legitimately
+            # overlap with _ALL_TERMS' condition vocabulary (e.g. a visit
+            # reason of "diabetes follow-up") -- ground it the same way
+            # snapshot conditions are, so a real, sourced fact from this
+            # tool isn't falsely flagged as unverified.
+            for enc in rec.output.encounters:
+                vocab.add(enc.text.lower())
     return vocab
 
 

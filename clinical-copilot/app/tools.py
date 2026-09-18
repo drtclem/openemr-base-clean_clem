@@ -23,11 +23,15 @@ from app.schemas import (
     CheckAllergyConflictOutput,
     ConditionFact,
     DuplicatePatientWarning,
+    EncounterFact,
     GetPatientSnapshotInput,
     GetPatientSnapshotOutput,
+    GetRecentEncountersInput,
+    GetRecentEncountersOutput,
     MedicationFact,
     ToolFailure,
 )
+from app.sensitivity import Role, filter_encounters_by_sensitivity
 
 _DATA_ABSENT_SYSTEM = "http://terminology.hl7.org/CodeSystem/data-absent-reason"
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -260,4 +264,100 @@ def check_allergy_conflict(fhir: FhirClient, raw_input: dict) -> CheckAllergyCon
         checked_allergy_count=len(entries),
         low_confidence=low_confidence,
         source_resources=source_resources,
+    )
+
+
+# Every real user of get_recent_encounters maps to USERS.md's single
+# overnight cross-covering resident persona, which ARCHITECTURE.md 3.3
+# confirms never holds a High-sensitivity grant (audit-notes.md's gacl
+# matrix -- the clin/physician-covering roles this persona maps to hold no
+# High grant). Hard-coded here, not looked up, because no endpoint a
+# resident's own user/-scoped token can call exposes their ACL role in this
+# build: OpenEMR's OIDC discovery document advertises a `/userinfo`
+# endpoint, but no handler for it actually exists (confirmed by reading
+# AuthorizationController.php); the standard REST API's only user-lookup
+# route (`GET /api/user*`) requires `admin/users` ACL, which this persona
+# doesn't hold either. "clin" is therefore the correct behavior for every
+# real user of this tool today, not an approximation standing in for a
+# missing lookup -- if a broader-clearance persona is ever added, resolving
+# the role per-session becomes a real gap to close, not before.
+_RESIDENT_ROLE: Role = "clin"
+
+
+def get_recent_encounters(fhir: FhirClient, raw_input: dict) -> GetRecentEncountersOutput | ToolFailure:
+    try:
+        params = GetRecentEncountersInput.model_validate(raw_input)
+    except Exception:
+        return ToolFailure(
+            tool="get_recent_encounters",
+            reason="I couldn't process that patient reference -- it wasn't a valid patient ID.",
+            detail_code="invalid_input",
+        )
+
+    try:
+        bundle = fhir.search("Encounter", {"patient": params.patient_id})
+    except FhirRequestError as exc:
+        return ToolFailure(
+            tool="get_recent_encounters",
+            reason=f"I couldn't retrieve this patient's encounter history ({exc.detail_code}).",
+            detail_code=exc.detail_code,  # type: ignore[arg-type]
+        )
+    fhir_encounters = bundle_entries(bundle)
+
+    # The FHIR Encounter resource carries no sensitivity field at all
+    # (confirmed by code read and a live test -- ARCHITECTURE.md 3.3,
+    # architecture-audit.md 6.9), so sensitivity is sourced from OpenEMR's
+    # own standard REST API instead -- still "OpenEMR's REST/FHIR API" per
+    # ARCHITECTURE.md 1.3, not a direct-database read (app/fhir_client.py's
+    # get_standard_api()).
+    partial_failures: list[str] = []
+    sensitivity_by_uuid: dict[str, str] = {}
+    try:
+        standard_encounters = fhir.get_standard_api(f"/patient/{params.patient_id}/encounter")
+        if isinstance(standard_encounters, list):
+            for enc in standard_encounters:
+                euuid = enc.get("uuid")
+                if euuid:
+                    sensitivity_by_uuid[euuid] = (enc.get("sensitivity") or "").lower()
+    except FhirRequestError as exc:
+        partial_failures.append(f"sensitivity lookup: {exc.detail_code}")
+
+    # Unknown sensitivity (the lookup above failed entirely, or this
+    # specific encounter has no matching standard-API row) is treated as
+    # "high" -- fail closed. This is the opposite failure mode from
+    # get_patient_snapshot's other sub-fetches, which surface partial data
+    # on failure: ARCHITECTURE.md 3.3's compensating control exists
+    # specifically to fail closed, not open, so an unreadable sensitivity
+    # value must exclude an encounter, never include it by default.
+    raw_for_filter = [
+        {"id": res.get("id"), "sensitivity": sensitivity_by_uuid.get(res.get("id"), "high")}
+        for res in fhir_encounters
+        if res.get("id")
+    ]
+    allowed_ids = {e["id"] for e in filter_encounters_by_sensitivity(raw_for_filter, _RESIDENT_ROLE)}
+
+    encounters: list[EncounterFact] = []
+    for res in fhir_encounters:
+        if res.get("id") not in allowed_ids:
+            continue
+        type_concepts = res.get("type") or []
+        text, _ = _codeable_concept_text(type_concepts[0]) if type_concepts else ("unknown", False)
+        if text == "unknown":
+            reason_codes = res.get("reasonCode") or []
+            if reason_codes:
+                text, _ = _codeable_concept_text(reason_codes[0])
+        encounters.append(
+            EncounterFact(
+                text=text,
+                status=res.get("status"),
+                period_start=(res.get("period") or {}).get("start"),
+                source_resource=f"Encounter/{res.get('id')}",
+            )
+        )
+
+    return GetRecentEncountersOutput(
+        patient_id=params.patient_id,
+        encounters=encounters,
+        sensitivity_filtered_count=len(fhir_encounters) - len(encounters),
+        partial_failures=partial_failures,
     )

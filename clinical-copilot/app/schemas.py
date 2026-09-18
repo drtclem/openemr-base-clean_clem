@@ -94,6 +94,35 @@ class CheckAllergyConflictOutput(BaseModel):
     source_resources: list[str]
 
 
+# --- get_recent_encounters (Phase 6, CLAUDE_CODE_BUILD_INSTRUCTIONS.md) -----
+
+
+class GetRecentEncountersInput(BaseModel):
+    patient_id: str = Field(..., description="OpenEMR FHIR Patient resource id (UUID).")
+
+
+class EncounterFact(BaseModel):
+    text: str  # encounter type/reason display
+    status: str | None
+    period_start: str | None
+    source_resource: str  # e.g. "Encounter/<fhir-id>"
+
+
+class GetRecentEncountersOutput(BaseModel):
+    patient_id: str
+    encounters: list[EncounterFact]
+    sensitivity_filtered_count: int = Field(
+        ...,
+        description=(
+            "How many encounters the compensating sensitivity filter (app/sensitivity.py, "
+            "ARCHITECTURE.md 3.3) excluded before reaching `encounters` above -- never silently "
+            "zero, so a resident/log reader can tell filtering is active even when nothing this "
+            "call happened to exclude anything."
+        ),
+    )
+    partial_failures: list[str] = Field(default_factory=list)
+
+
 # --- shared tool-failure envelope (ARCHITECTURE.md Section 2, 4) ------------
 
 

@@ -17,8 +17,13 @@ import anthropic
 from app.config import Settings
 from app.fhir_client import FhirClient
 from app.observability import TurnObserver
-from app.schemas import CheckAllergyConflictOutput, GetPatientSnapshotOutput, ToolFailure
-from app.tools import check_allergy_conflict, get_patient_snapshot
+from app.schemas import (
+    CheckAllergyConflictOutput,
+    GetPatientSnapshotOutput,
+    GetRecentEncountersOutput,
+    ToolFailure,
+)
+from app.tools import check_allergy_conflict, get_patient_snapshot, get_recent_encounters
 from app.verification import ToolCallRecord, verify_response
 
 SYSTEM_PROMPT = """\
@@ -39,6 +44,10 @@ Hard rules:
   (a possible duplicate), say so explicitly rather than picking one.
 - Before you mention giving, starting, or continuing any medication for \
   this patient, call check_allergy_conflict for that medication first.
+- If asked to verify a sign-out instruction, compare it to the patient's \
+  recent visit/encounter history via get_recent_encounters, not just the \
+  snapshot -- a sign-out claim can be stale relative to what's actually \
+  happened since.
 - If you don't know something, say you don't know. Do not guess.
 """
 
@@ -77,11 +86,33 @@ TOOLS = [
             "required": ["patient_id", "medication_name"],
         },
     },
+    {
+        "name": "get_recent_encounters",
+        "description": (
+            "Get this patient's recent visit/encounter history (type, status, date), "
+            "pulled live from OpenEMR via FHIR. Use this to verify a sign-out "
+            "instruction against what's actually happened, or to check for recent "
+            "visits a snapshot alone wouldn't surface. High-sensitivity encounters "
+            "this resident's role isn't cleared for are excluded before you ever "
+            "see them -- not something you need to filter yourself."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "patient_id": {
+                    "type": "string",
+                    "description": "OpenEMR FHIR Patient resource id (UUID).",
+                }
+            },
+            "required": ["patient_id"],
+        },
+    },
 ]
 
 _TOOL_IMPLS = {
     "get_patient_snapshot": get_patient_snapshot,
     "check_allergy_conflict": check_allergy_conflict,
+    "get_recent_encounters": get_recent_encounters,
 }
 
 MAX_TOOL_ROUNDS = 6
@@ -287,7 +318,10 @@ class ClinicalCopilotAgent:
 
 
 def _to_jsonable(output) -> dict:
-    if isinstance(output, (GetPatientSnapshotOutput, CheckAllergyConflictOutput, ToolFailure)):
+    if isinstance(
+        output,
+        (GetPatientSnapshotOutput, CheckAllergyConflictOutput, GetRecentEncountersOutput, ToolFailure),
+    ):
         return output.model_dump()
     return {"error": "unexpected tool output type"}
 

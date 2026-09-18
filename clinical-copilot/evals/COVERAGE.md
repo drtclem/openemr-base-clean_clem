@@ -10,7 +10,7 @@
   (`get_patient_snapshot`, `check_allergy_conflict`) and `verification.py`'s
   stripping logic, independent of whether the model behaves well on any
   given day. Free and instant, so there's no reason not to run it constantly.
-- **`evals/cases.py`** (the 10 cases below) -- exercises the agent's actual
+- **`evals/cases.py`** (the 11 cases below) -- exercises the agent's actual
   LLM behavior, real Anthropic calls, costs real spend per run. Triggered
   manually / before deploys (`python3 -m evals.run_evals`), not on every
   commit.
@@ -24,7 +24,7 @@ verification change).
 
 ## Golden Set vs. Behavioral Coverage
 
-The current 10 LLM-based cases in `evals/cases.py` are, by definition, a
+The current 11 LLM-based cases in `evals/cases.py` are, by definition, a
 **Golden Set**: small, every case expected to pass, correctness-focused --
 each one pins down a specific known fact, invariant, or prior finding, and a
 failure means something genuinely broke. This is deliberately not yet
@@ -178,7 +178,7 @@ worthwhile, following the same process (read real traces, name failure
 modes in plain language, then cluster), not by inventing more cases from a
 checklist.
 
-**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 10 cases
+**Langfuse Datasets/Experiments wiring**, deferred deliberately (2026-09-16): register the Golden Set's 11 cases
 as a persisted Langfuse Dataset (one item per case, keyed by case name for
 idempotent re-creation) so pass-rate history becomes a visible trend across
 runs in the Langfuse UI (Datasets/Experiments in the sidebar), not just a
@@ -216,6 +216,7 @@ is a synthesis/formatting pass over what's already there, not new analysis.
 | `adversarial_unverifiable_claim` | invariant | 1 (rapid orientation) | KEY_METRICS.md North Star (verification pass rate) |
 | `domain_constraint_allergy_hard_block` | invariant | 3 (time-critical synthesis, allergy check before empiric order) | ARCHITECTURE.md 3.2 + AUDIT.md Finding 11 (uncoded allergy data-fidelity) |
 | `domain_constraint_cross_reactive_allergy` | invariant | 3 (time-critical synthesis, allergy check before empiric order) | ARCHITECTURE.md 3.2 Phase 5 addition (`app/clinical_reference.py`): the allergy-conflict wall must also catch a cross-reactive drug-class match, not only an exact allergy-name match |
+| `encounter_sensitivity_filter_blocks_high` | invariant | 2 (verify a sign-out instruction against the current chart -- `get_recent_encounters` is how the resident checks what's actually happened since sign-out) | Phase 6 (CLAUDE_CODE_BUILD_INSTRUCTIONS.md) + ARCHITECTURE.md 3.3: the compensating sensitivity filter must exclude a high-sensitivity encounter from the model's context entirely. Also this suite's "unauthorized access" case (Phase 3/6 tracker) -- a resident whose role holds no High-sensitivity grant is denied that encounter's content, the same shape as the PRD's original "unauthorized access" category, just role-based rather than OAuth-scope-based like `oauth_scope_enforcement_denied` |
 | `malformed_patient_id` | boundary | 1 (rapid orientation -- `get_patient_snapshot` backs use cases 1, 3 per ARCHITECTURE.md 2) | ARCHITECTURE.md Section 2/4 (tool-failure surfacing) |
 | `ambiguous_query_unspecified_medication` | boundary | 3 (allergy check before giving/continuing a medication -- `check_allergy_conflict` backs use cases 2, 3 per ARCHITECTURE.md 2) | PRD Evaluation requirement (ambiguous queries) |
 | `oauth_scope_enforcement_denied` | invariant | -- (Phase 1 auth invariant, not a USERS.md clinical use case) | CLAUDE_CODE_BUILD_INSTRUCTIONS.md Phase 1 + ARCHITECTURE.md 1.3 (a token's granted OAuth scope must actually bound what it can fetch) |
@@ -223,7 +224,11 @@ is a synthesis/formatting pass over what's already there, not new analysis.
 USERS.md use-case mapping note: where a case's `guards_against` text doesn't
 name a use case explicitly, the mapping above follows ARCHITECTURE.md
 Section 2's tool table (`get_patient_snapshot` -> use cases 1, 3;
-`check_allergy_conflict` -> use cases 2, 3) plus the case's own message
+`check_allergy_conflict` -> use cases 2, 3; `get_recent_encounters` -> use
+cases 1, 2, 4, though the case here specifically exercises **use case 2**,
+"verifying a sign-out instruction against the current chart" -- comparing
+what sign-out claims to what actually happened since requires exactly the
+recent-encounter history this tool provides) plus the case's own message
 content. No case here exercises use case 4 (end-of-shift summary) --
 consistent with USERS.md itself flagging that as lower-priority, build-only-
 if-time-allows. `oauth_scope_enforcement_denied` is the one exception to
@@ -281,13 +286,41 @@ silently absent:
   platform gap) or have to pick a boundary that happens to pass, which
   would misrepresent what's actually enforced. No case exists because the
   boundary itself doesn't exist yet, not because it was missed.
-- **Encounter sensitivity filtering** (`app/sensitivity.py`) is built and
-  unit-tested in isolation (`evals/unit_tests.py`'s
-  `test_sensitivity_filter_excludes_high_for_clin`/`_allows_high_for_doc`),
-  but has no LLM-behavior case here yet -- `get_recent_encounters`, the
-  tool that would actually call it, isn't built (a later phase per
-  `CLAUDE_CODE_BUILD_INSTRUCTIONS.md`). Nothing to exercise end-to-end
-  until that tool exists.
+- **CLOSED 2026-09-18 (Phase 6): encounter sensitivity filtering.**
+  `get_recent_encounters` is built and wired to `app/sensitivity.py`;
+  `encounter_sensitivity_filter_blocks_high` exercises it end-to-end
+  against pid4's real `sensitivity='high'` test encounter. See the new gap
+  immediately below, though -- the tool's live sensitivity lookup depends
+  on a currently-broken platform path, so this closes the *coverage* gap,
+  not a fully working production path yet.
+- **NEW, Phase 6: OpenEMR's standard REST API bearer-token validation is
+  broken for this build's real access tokens.** `get_recent_encounters`
+  sources `sensitivity` from OpenEMR's standard REST API (`GET /apis/
+  default/api/patient/{puuid}/encounter`) because FHIR's `Encounter`
+  resource has no sensitivity field at all (`ARCHITECTURE.md` 3.3). Every
+  real call to that endpoint 401s, for any token/role, confirmed via the
+  container's own error log:
+  `league/oauth2-server`'s `BearerTokenValidator` validates this server's
+  real `RS256`-signed access tokens (confirmed by decoding a live token's
+  header) against an `HS256` signature constraint
+  (`BearerTokenAuthorizationStrategy.php:341` ->
+  `ResourceServer::validateAuthenticatedRequest()` ->
+  `RequiredConstraintsViolated` -> `OAuthServerException::accessDenied()`,
+  code 9, "The resource owner or authorization server denied the
+  request."). FHIR routes don't hit this same validator/constraint and
+  work fine with the identical token. This is a platform-level bug in this
+  OpenEMR build, not this project's code -- `get_recent_encounters` fails
+  closed correctly when it happens (treats unreadable sensitivity as
+  `'high'`, excludes the encounter, per `ARCHITECTURE.md` 3.3's "fail
+  closed, not open"), but that means **every real call today returns zero
+  encounters**, not a working tool. `encounter_sensitivity_filter_blocks_
+  high` proves the filter's own logic is correct by substituting a stub
+  that returns the real, known sensitivity values through a different
+  path (see `evals/cases.py`'s `_RealSensitivityFhirClient`) -- it does
+  not, and cannot, prove the live standard-API path itself works, because
+  it doesn't. Fixing the validator/constraint mismatch is real work
+  outside this project's scope; named here so it isn't mistaken for
+  already resolved.
 - **Conversation ownership / session binding** (`THREAT_MODEL.md` 4.7):
   `conversation_id` isn't bound to the authenticated session that created
   it, and `_conversations` (`app/main.py`) is a single unscoped
