@@ -565,6 +565,55 @@ contain. The data exposed was synthetic demo-patient data throughout
 real PHI — the finding's significance is the mechanism, assessed as if it
 scaled to a real deployment, which is exactly this threat model's purpose.
 
+**A sixth finding, same investigation, disabled 2026-09-19: an
+undocumented `doc`-group (Physicians, full practice-wide access) account,
+`reviewer`, already existed on the droplet.** Found while creating
+`grader_1` — not referenced anywhere in `README.md`, this document, or
+`audit-notes.md` before now. Investigated directly against the droplet's
+database (read-only, before any action taken) rather than guessed at:
+
+- **Creation:** `users.date_created = 2026-09-17 01:58:15` — two days after
+  `admin` (`2026-09-15 01:05:16`), the droplet's own base account. This
+  rules out both candidate explanations named at the time it was found: it
+  did not come bundled with the base OpenEMR image (a stock image ships no
+  such account, and the display name "Reviewer Grader" is plainly
+  purpose-built for this project), and it was not present before this
+  project's droplet existed — it was created sometime after the droplet
+  was already standing up this fork's own work.
+- **ACL group:** `doc` (Physicians) — confirmed via `gacl_aro`/
+  `gacl_groups_aro_map`/`gacl_aro_groups`, the same broad, practice-wide
+  clinical role `dr_1` holds in `audit-notes.md`, notably broader than the
+  `clin` group used for every other purpose-built demo/test account in this
+  project (`copilot_resident_1`, `clin_1`, and now `grader_1`).
+- **Login history:** the `log` table shows exactly two successful `login`
+  events, both 2026-09-17 — `02:00:15` from `172.18.0.1` (a Docker-internal
+  bridge address, consistent with this project's own documented
+  Selenium-container browser-testing pattern, not an external caller) and
+  `03:34:15` from `79.127.222.136` (the same public address this
+  workstation used for every piece of browser automation performed
+  tonight, including the real `grader_1` verification above). Between
+  those two logins the account generated 5,792 audit-log rows total
+  (`02:00:15`–`2026-09-18 12:59:26`) — a real, active UI session's worth of
+  internal activity, not an unused or dormant account, but bounded to
+  those two sessions rather than continuous/ongoing use.
+
+**Assessment:** this evidence strongly suggests `reviewer` was this
+project's own test/demo account from around when Phase 1's login work was
+being built (2026-09-17, the same day `24448c1` landed) — both login
+sources trace back to this project's own infrastructure and workstation,
+not to an unrelated third party, and the timing lines up with active
+development of the exact login flow this account would have been used to
+exercise. **But intent cannot be fully confirmed from logs alone** — the
+audit trail shows *what* happened (two logins, this project's own IPs, a
+session's worth of activity) but not *why* the account was created or by
+whom specifically, and it was never documented in any doc at the time,
+which is itself the same class of gap this section's other findings
+describe: real, purpose-built access that existed without a paper trail
+until an unrelated task stumbled onto it. Disabled (`users.active=0`,
+confirmed load-bearing via `AuthUtils.php`'s login check, not cosmetic),
+not deleted — the account and its full audit history remain intact and
+inspectable if this needs revisiting.
+
 **Likelihood: Low-Medium, unchanged** — still requires knowing/using the
 documented grading credential, not just reaching an open port; rotating
 *which* account is documented doesn't change how easy the credential is to
@@ -783,6 +832,7 @@ the local-dev-only `false` override clearly scoped and documented in
 | 4.4 | Indirect prompt injection via uncoded/free-text chart fields | Medium | Medium-High | **Partially mitigated** -- structural prevention layer closed 2026-09-18; curated-vocabulary detection/enforcement blind spots still open |
 | 4.4a | Domain-constraint hard-block only covers ~27 hardcoded drug names | Medium | High | **Partially mitigated / Open** |
 | 4.5 | Public unauthenticated `/chat` + `/ui` — real risk is PHI exposure, not just cost | Low-Medium (was High) | High via `/chat` (unchanged, confirmed live -- cross-provider gap unaffected by credential); Low via direct OpenEMR UI misuse (was High -- credential rotated `admin`→`grader_1`, a clinician-shaped account) | **Largely mitigated, actually deployed 2026-09-18/19** — the live grading droplet was found running zero-auth code well after this was documented as fixed (deployment drift + a broken OpenEMR container + a hardcoded localhost setting, all traced and closed same night, see incident writeup above); real login now genuinely required there, re-verified end-to-end; grading credential rotated to a narrower account; residual `/chat`-path PHI-breadth risk is §4.3's cross-provider gap, not credential choice |
+| 4.5a | Undocumented `doc`-group account `reviewer` found on the droplet during the 4.5 investigation | — | Medium (full practice-wide clinical access, if misused) | **Disabled 2026-09-19** (`users.active=0`, not deleted — audit trail intact); evidence (creation timestamp, both login IPs, activity volume) strongly suggests this project's own Phase 1-era test account, not external access, but intent not fully confirmable from logs alone; never documented at the time |
 | 4.6 | PHI in logs / self-hosted Langfuse, no retention/redaction policy | — | Medium | **Partially mitigated** |
 | 4.7 | No `conversation_id` ↔ identity binding | Low-Medium | Medium | **Open** |
 | 4.7a | Unbounded in-memory conversation store (availability) | Medium | Medium | **Open** |
