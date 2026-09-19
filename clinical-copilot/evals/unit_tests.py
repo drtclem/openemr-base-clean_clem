@@ -21,11 +21,15 @@ from __future__ import annotations
 import sys
 from typing import Callable
 
+import httpx
+
 from app.agent import ClinicalCopilotAgent
 from app.auth import OAuthTokenProvider
 from app.config import get_settings
 from app.fhir_client import FhirClient
 from app.reference_layer import (
+    _DAILYMED_BASE,
+    _MEDLINEPLUS_BASE,
     _build_dailymed_query,
     _build_medlineplus_query,
     _fetch_dailymed_note,
@@ -646,6 +650,36 @@ def test_shift_summary_reports_nothing_gathered_yet(fhir: FhirClient) -> tuple[b
 # calls to DailyMed/MedlinePlus (not mocked) -- same "test against the real
 # thing" convention already used for get_patient_snapshot/check_allergy_
 # conflict above against real FHIR data.
+#
+# Unlike the FHIR calls above (this project's own dev stack, expected to
+# always be up during a test run), DailyMed/MedlinePlus are third-party
+# public services this project doesn't control -- an outage or a slow
+# network there is a real possibility, and it must not look like a
+# regression in our own code. _external_api_reachable() draws that line
+# explicitly: a probe that can't even connect (DNS/TCP/TLS/timeout) means
+# the API itself is unavailable, so the affected test is reported as a
+# labeled SKIP (matching evals/run_evals.py's existing skip_reason
+# convention), not a FAIL. A probe that DOES connect -- even a 4xx/5xx --
+# means the service is up and whatever comes back is real, so the test
+# proceeds and a genuine mismatch there (extraction logic broke, or the
+# label/page's shape changed) is a real, meaningful failure, not
+# something to paper over. This mirrors the feature's own philosophy at
+# the test layer: distinguish "we couldn't check" from "we checked and it
+# was wrong," the same distinction app/reference_layer.py itself makes
+# between an honest no-reference-available and something worth surfacing.
+
+
+def _external_api_reachable(url: str, params: dict[str, str]) -> bool:
+    """Best-effort connectivity probe for a real third-party API. Only a
+    connection-level failure (DNS, TCP, TLS, timeout) counts as
+    unreachable -- any actual HTTP response, including a 4xx/5xx, means
+    the service is up, so `raise_for_status()` is deliberately NOT called
+    here."""
+    try:
+        httpx.get(url, params=params, timeout=5.0)
+        return True
+    except httpx.HTTPError:
+        return False
 
 
 def test_reference_layer_query_isolation(fhir: FhirClient) -> tuple[bool, str]:
@@ -674,6 +708,8 @@ def test_reference_layer_query_isolation(fhir: FhirClient) -> tuple[bool, str]:
 def test_reference_layer_dailymed_real_match(fhir: FhirClient) -> tuple[bool, str]:
     """Real match against the live DailyMed API: Lisinopril's modern-format
     label has an extractable Warnings and Precautions excerpt."""
+    if not _external_api_reachable(f"{_DAILYMED_BASE}/spls.json", _build_dailymed_query("Lisinopril")):
+        return True, "SKIPPED: DailyMed unreachable (network/infra issue, not a regression) -- rerun once connectivity is restored"
     note = _fetch_dailymed_note("Lisinopril")
     if note.note_text is None:
         return False, "expected a real Warnings and Precautions excerpt for Lisinopril, got note_text=None"
@@ -685,6 +721,8 @@ def test_reference_layer_dailymed_real_match(fhir: FhirClient) -> tuple[bool, st
 def test_reference_layer_medlineplus_real_match(fhir: FhirClient) -> tuple[bool, str]:
     """Real match against the live MedlinePlus Health Topics Search API,
     using pid1's actual chart-sourced condition text."""
+    if not _external_api_reachable(_MEDLINEPLUS_BASE, _build_medlineplus_query("Type 2 diabetes mellitus")):
+        return True, "SKIPPED: MedlinePlus unreachable (network/infra issue, not a regression) -- rerun once connectivity is restored"
     note = _fetch_medlineplus_note("Type 2 diabetes mellitus")
     if note.note_text is None:
         return False, "expected a real MedlinePlus summary for Type 2 diabetes mellitus, got note_text=None"
@@ -698,7 +736,16 @@ def test_reference_layer_dailymed_honest_no_reference(fhir: FhirClient) -> tuple
     uses the older LOINC 34071-1 'WARNINGS SECTION' format with no
     extractable excerpt -- confirmed live before writing the extraction
     logic. This must come back as note_text=None, never a fabricated or
-    paraphrased-from-memory substitute."""
+    paraphrased-from-memory substitute.
+
+    Guarded by the same reachability probe as the real-match test above:
+    without it, a DailyMed outage would make this test pass for the wrong
+    reason (note_text=None because nothing responded, not because of the
+    older-label format this test actually exists to check) -- a false
+    pass that masks an outage is worse than a false fail that just needs
+    a rerun."""
+    if not _external_api_reachable(f"{_DAILYMED_BASE}/spls.json", _build_dailymed_query("Penicillin")):
+        return True, "SKIPPED: DailyMed unreachable (network/infra issue, not a regression) -- rerun once connectivity is restored"
     note = _fetch_dailymed_note("Penicillin")
     if note.note_text is not None:
         return False, f"expected note_text=None for Penicillin's older-format label, got {note.note_text!r}"
@@ -708,7 +755,12 @@ def test_reference_layer_dailymed_honest_no_reference(fhir: FhirClient) -> tuple
 
 
 def test_reference_layer_medlineplus_honest_no_reference(fhir: FhirClient) -> tuple[bool, str]:
-    """Honest failure for a condition with no real MedlinePlus entry."""
+    """Honest failure for a condition with no real MedlinePlus entry.
+    Same reachability guard as the DailyMed honest-no-reference test
+    above, and for the same reason: an outage must not silently pass as
+    "correctly found nothing"."""
+    if not _external_api_reachable(_MEDLINEPLUS_BASE, _build_medlineplus_query("zzqxnotarealcondition12345")):
+        return True, "SKIPPED: MedlinePlus unreachable (network/infra issue, not a regression) -- rerun once connectivity is restored"
     note = _fetch_medlineplus_note("zzqxnotarealcondition12345")
     if note.note_text is not None:
         return False, f"expected note_text=None for a nonsense condition, got {note.note_text!r}"
@@ -812,11 +864,20 @@ def main() -> int:
 
     total = len(results)
     passed_count = sum(1 for _, p, _ in results if p)
+    skipped_count = sum(1 for _, p, r in results if p and r.startswith("SKIPPED:"))
     print(f"\n{'=' * 70}")
-    print(f"Clinical Co-Pilot unit tests (LLM-free): {passed_count}/{total} passed")
+    summary = f"Clinical Co-Pilot unit tests (LLM-free): {passed_count}/{total} passed"
+    if skipped_count:
+        summary += f" ({skipped_count} skipped -- external API unreachable, not a regression)"
+    print(summary)
     print(f"{'=' * 70}\n")
     for name, passed, reason in results:
-        status = "PASS" if passed else "FAIL"
+        # A "SKIPPED:" reason (see _external_api_reachable's callers) means an
+        # external dependency (DailyMed/MedlinePlus) was unreachable -- passed=True
+        # so it doesn't block the suite, same convention as evals/run_evals.py's
+        # skip_reason, but shown as SKIP here, not PASS, so it stays visible
+        # rather than reading as a real, checked pass.
+        status = "SKIP" if passed and reason.startswith("SKIPPED:") else ("PASS" if passed else "FAIL")
         print(f"[{status}] {name}")
         print(f"       {reason}\n")
 

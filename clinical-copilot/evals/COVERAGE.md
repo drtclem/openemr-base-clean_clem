@@ -670,3 +670,25 @@ in test-runner output:
 | `test_reference_layer_medlineplus_honest_no_reference` | regression | Honest-failure companion for a nonsense condition string with no real MedlinePlus entry -- `note_text=None`, not fabricated. |
 | `test_reference_layer_mere_mention_does_not_trigger` | invariant | Medication-path trigger must not fire on a drug merely read off an existing med list ("Her current medications are Metformin and Lisinopril") -- only an actual recommendation to start/adjust/stop should reach DailyMed. |
 | `test_reference_layer_past_tense_history_does_not_trigger` | regression | User-specified adversarial case added on approval of `medical_reference_layer_prompt.md`'s design: a response narrating a past medication action ("she was started on lisinopril last year, then discontinued due to a cough") must not trigger the medication path, since it's history, not a current recommendation -- the exact false-positive risk named in `_medications_recommended`'s own docstring, and the same class of substring-vs-word-boundary bug found and fixed four times earlier against `verification.py` (`started` must not match inside `starting`'s pattern, and vice versa: `start`/`starting`/etc. must not match inside `started`/`discontinued`). Fixed proactively via a word-boundary regex restricted to base/gerund verb forms, excluding simple past tense, before this shipped -- confirmed empirically against this exact sentence, not assumed. Control confirms a genuine current recommendation in the same shape still fires. |
+
+**A note on the 4 tests above that hit real third-party APIs** (`..._real_match`
+and `..._honest_no_reference`, both sources): DailyMed and MedlinePlus are
+public services this project doesn't control, unlike the FHIR calls in the
+rest of this suite (this project's own dev stack). Each of these 4 first
+calls `_external_api_reachable()` -- a connectivity-only probe (DNS/TCP/TLS/
+timeout) against the same endpoint the real fetch would use. If the probe
+can't even connect, the test reports a labeled `SKIPPED: ... unreachable`
+result (passed=True, but printed as `SKIP` not `PASS` by `evals/unit_tests.py`'s
+`main()`), the same `skip_reason` convention `evals/run_evals.py` already uses
+for a missing precondition -- an outage doesn't fail the suite or block a
+commit. If the probe DOES get a response (even a 4xx/5xx -- `raise_for_status()`
+is deliberately not called), the service is up, so the test proceeds and a
+genuine mismatch is a real failure worth surfacing, not something skipped.
+This matters most for the two `..._honest_no_reference` tests: without the
+probe, a total outage would make `_fetch_dailymed_note`/`_fetch_medlineplus_note`
+return `note_text=None` for the exact same reason the "honest no reference"
+behavior does, so the test would silently PASS for the wrong reason and mask
+a real outage -- worse than a false FAIL, since nothing would ever flag it.
+Confirmed live by simulating a total outage (patched `httpx.get` to raise a
+connect timeout): all 4 tests correctly reported `SKIPPED`, not a false PASS
+or FAIL, and the overall suite still exited 0.
