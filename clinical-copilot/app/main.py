@@ -29,6 +29,7 @@ from app.agent import ClinicalCopilotAgent
 from app.config import get_settings
 from app.observability import TurnObserver
 from app.oauth_session import SESSION_COOKIE_NAME, LoginError, SessionStore
+from app.schemas import ReferenceNote
 from app.verification import ToolCallRecord
 
 _READINESS_TIMEOUT_S = 2.5
@@ -109,6 +110,10 @@ class ChatResponse(BaseModel):
     flagged_claims: list[str]
     enforced_warnings: list[str]
     tool_calls: list[dict]
+    # Informational DailyMed/MedlinePlus footnotes (app/reference_layer.py) --
+    # a separate field, never folded into `response`, so a client renders it
+    # distinctly from the model's own text. Empty list when nothing triggers.
+    reference_notes: list[ReferenceNote]
 
 
 @app.get("/health")
@@ -455,4 +460,5 @@ def chat(
         flagged_claims=result.flagged_claims,
         enforced_warnings=result.enforced_warnings,
         tool_calls=result.tool_calls,
+        reference_notes=result.reference_notes,
     )

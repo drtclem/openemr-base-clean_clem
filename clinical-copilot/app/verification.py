@@ -367,6 +367,16 @@ def _find_candidate_terms(text: str) -> list[str]:
     return unique
 
 
+def medication_candidates_in(text: str) -> list[str]:
+    """Public wrapper for other modules (app/reference_layer.py) that need
+    "does this text mention a medication-shaped term" without reaching
+    into this module's private _find_candidate_terms/_MEDICATION_TERMS --
+    the same filter _check_domain_constraint already applies internally,
+    exposed intentionally rather than imported across the underscore
+    boundary."""
+    return [t for t in _find_candidate_terms(text) if t.lower() in _MEDICATION_TERMS]
+
+
 def _check_source_attribution(
     draft_response: str, grounded: set[str]
 ) -> tuple[str, list[str]]:

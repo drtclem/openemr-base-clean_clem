@@ -17,12 +17,14 @@ import anthropic
 from app.config import Settings
 from app.fhir_client import FhirClient
 from app.observability import TurnObserver
+from app.reference_layer import build_reference_notes
 from app.schemas import (
     CheckAllergyConflictOutput,
     CompareSignoutToChartOutput,
     GetPatientSnapshotOutput,
     GetRecentEncountersOutput,
     GetRecentObservationsOutput,
+    ReferenceNote,
     SummarizeShiftEventsOutput,
     ToolFailure,
 )
@@ -246,6 +248,12 @@ class ChatTurnResult:
     # back in as run_turn()'s prior_tool_records on the next call -- see
     # that parameter's docstring for why (ERROR_ANALYSIS.md Entry 5).
     accumulated_tool_records: list[ToolCallRecord] = field(default_factory=list)
+    # Informational DailyMed/MedlinePlus footnotes (app/reference_layer.py)
+    # -- deliberately a SEPARATE field, never concatenated into
+    # response_text, so it's unambiguously distinguishable from something
+    # the model itself asserted. Empty list when nothing triggers; never
+    # part of `updated_history`/the model's own context on a later turn.
+    reference_notes: list[ReferenceNote] = field(default_factory=list)
 
 
 class ClinicalCopilotAgent:
@@ -386,6 +394,11 @@ class ClinicalCopilotAgent:
 
         messages.append({"role": "assistant", "content": outcome.final_response})
 
+        # Deterministic, model-free post-processing (app/reference_layer.py) --
+        # runs on the already-verified final response text, never re-enters
+        # `messages`/the model's own context on a later turn.
+        reference_notes = build_reference_notes(outcome.final_response, records_for_active_patient)
+
         return ChatTurnResult(
             correlation_id=correlation_id,
             response_text=outcome.final_response,
@@ -396,6 +409,7 @@ class ClinicalCopilotAgent:
             tool_calls=tool_call_log,
             updated_history=messages,
             accumulated_tool_records=turn_records,
+            reference_notes=reference_notes,
         )
 
     def _call_tool(

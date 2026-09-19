@@ -25,6 +25,13 @@ from app.agent import ClinicalCopilotAgent
 from app.auth import OAuthTokenProvider
 from app.config import get_settings
 from app.fhir_client import FhirClient
+from app.reference_layer import (
+    _build_dailymed_query,
+    _build_medlineplus_query,
+    _fetch_dailymed_note,
+    _fetch_medlineplus_note,
+    _medications_recommended,
+)
 from app.schemas import (
     CheckAllergyConflictOutput,
     DuplicatePatientWarning,
@@ -632,6 +639,128 @@ def test_shift_summary_reports_nothing_gathered_yet(fhir: FhirClient) -> tuple[b
     return True, "cross-patient tool call was blocked before any FHIR read; matching patient_id still works"
 
 
+# --- Medical reference layer (app/reference_layer.py) -----------------------
+#
+# medical_reference_layer_prompt.md's approved design, §6, plus the user's
+# explicit addition of the past-tense negative case. Real, live network
+# calls to DailyMed/MedlinePlus (not mocked) -- same "test against the real
+# thing" convention already used for get_patient_snapshot/check_allergy_
+# conflict above against real FHIR data.
+
+
+def test_reference_layer_query_isolation(fhir: FhirClient) -> tuple[bool, str]:
+    """Patient-data isolation, enforced structurally: the outbound query
+    dicts must contain only the drug/condition name string plus fixed,
+    non-patient-identifying constants -- never a patient ID, chart data,
+    or the resident's raw message. Tested against the pure, network-free
+    query-builder functions rather than intercepting live HTTP, per the
+    approved design (app/reference_layer.py's own docstring on why these
+    are split out)."""
+    dailymed_query = _build_dailymed_query("Lisinopril")
+    if dailymed_query.get("drug_name") != "Lisinopril":
+        return False, f"expected drug_name='Lisinopril', got {dailymed_query!r}"
+    if set(dailymed_query) != {"drug_name", "name_type", "pagesize"}:
+        return False, f"expected only {{drug_name, name_type, pagesize}} keys, got {dailymed_query!r}"
+
+    medlineplus_query = _build_medlineplus_query("Type 2 diabetes mellitus")
+    if medlineplus_query.get("term") != "Type 2 diabetes mellitus":
+        return False, f"expected term='Type 2 diabetes mellitus', got {medlineplus_query!r}"
+    if set(medlineplus_query) != {"db", "term", "retmax"}:
+        return False, f"expected only {{db, term, retmax}} keys, got {medlineplus_query!r}"
+
+    return True, "both outbound query dicts contain only the bare name plus fixed constants, nothing patient-identifying"
+
+
+def test_reference_layer_dailymed_real_match(fhir: FhirClient) -> tuple[bool, str]:
+    """Real match against the live DailyMed API: Lisinopril's modern-format
+    label has an extractable Warnings and Precautions excerpt."""
+    note = _fetch_dailymed_note("Lisinopril")
+    if note.note_text is None:
+        return False, "expected a real Warnings and Precautions excerpt for Lisinopril, got note_text=None"
+    if note.source_url is None:
+        return False, "expected a source_url alongside a real excerpt"
+    return True, f"real DailyMed excerpt returned for Lisinopril: {note.note_text[:60]!r}..."
+
+
+def test_reference_layer_medlineplus_real_match(fhir: FhirClient) -> tuple[bool, str]:
+    """Real match against the live MedlinePlus Health Topics Search API,
+    using pid1's actual chart-sourced condition text."""
+    note = _fetch_medlineplus_note("Type 2 diabetes mellitus")
+    if note.note_text is None:
+        return False, "expected a real MedlinePlus summary for Type 2 diabetes mellitus, got note_text=None"
+    if "diabetes" not in note.note_text.lower():
+        return False, f"expected the summary to mention diabetes, got: {note.note_text!r}"
+    return True, f"real MedlinePlus summary returned: {note.note_text[:60]!r}..."
+
+
+def test_reference_layer_dailymed_honest_no_reference(fhir: FhirClient) -> tuple[bool, str]:
+    """Honest failure, not fabrication: Penicillin's real DailyMed label
+    uses the older LOINC 34071-1 'WARNINGS SECTION' format with no
+    extractable excerpt -- confirmed live before writing the extraction
+    logic. This must come back as note_text=None, never a fabricated or
+    paraphrased-from-memory substitute."""
+    note = _fetch_dailymed_note("Penicillin")
+    if note.note_text is not None:
+        return False, f"expected note_text=None for Penicillin's older-format label, got {note.note_text!r}"
+    if note.source_url is not None:
+        return False, f"expected source_url=None alongside note_text=None, got {note.source_url!r}"
+    return True, "Penicillin's older-format label correctly produces an honest 'no reference available', not a fabrication"
+
+
+def test_reference_layer_medlineplus_honest_no_reference(fhir: FhirClient) -> tuple[bool, str]:
+    """Honest failure for a condition with no real MedlinePlus entry."""
+    note = _fetch_medlineplus_note("zzqxnotarealcondition12345")
+    if note.note_text is not None:
+        return False, f"expected note_text=None for a nonsense condition, got {note.note_text!r}"
+    return True, "a nonsense condition string correctly produces an honest 'no reference available'"
+
+
+def test_reference_layer_mere_mention_does_not_trigger(fhir: FhirClient) -> tuple[bool, str]:
+    """Negative case: a drug merely mentioned/read off an existing med
+    list -- with no action verb nearby -- must not fire the medication
+    trigger. Not every medication name in a response should generate a
+    DailyMed lookup, only an actual recommendation to start/adjust/stop."""
+    fired = _medications_recommended("Her current medications are Metformin and Lisinopril.")
+    if fired:
+        return False, f"expected no medication trigger for a plain med-list mention, got {fired!r}"
+    return True, "a plain mention of existing medications correctly does not trigger the DailyMed path"
+
+
+def test_reference_layer_past_tense_history_does_not_trigger(fhir: FhirClient) -> tuple[bool, str]:
+    """User-specified adversarial negative case: a response describing a
+    past medication action ('she was started on lisinopril last year,
+    then discontinued due to a cough') must NOT trigger the medication
+    path, since it narrates history rather than recommending a current
+    action -- exactly the false-positive risk flagged in
+    _medications_recommended's own docstring. Confirmed here structurally
+    (word-boundary + morphological restriction to base/gerund forms,
+    excluding simple past tense) rather than trusting the heuristic
+    without a direct check against this exact sentence.
+
+    Control: a genuine current recommendation in a similar shape
+    ('Consider starting Lisinopril...') must still fire -- the fix
+    narrows what matches, it doesn't silence the trigger altogether.
+    """
+    history_text = "She was started on lisinopril last year, then discontinued due to a cough."
+    fired = _medications_recommended(history_text)
+    if fired:
+        return False, (
+            "expected the medication trigger to NOT fire on past-tense historical narration, "
+            f"got {fired!r} for: {history_text!r}"
+        )
+
+    control_text = "Consider starting Lisinopril 10mg daily for her hypertension."
+    control_fired = _medications_recommended(control_text)
+    if not control_fired:
+        return False, f"control failed: a genuine current recommendation should still fire, got {control_fired!r}"
+
+    return True, (
+        "past-tense historical narration ('was started ... discontinued') correctly does NOT "
+        "trigger the medication path, while a genuine current recommendation in a similar "
+        "shape still does"
+    )
+
+
 TESTS: list[tuple[str, Callable[[FhirClient], tuple[bool, str]]]] = [
     ("get_patient_snapshot_pid1", test_get_patient_snapshot_pid1),
     ("get_patient_snapshot_pid2", test_get_patient_snapshot_pid2),
@@ -652,6 +781,13 @@ TESTS: list[tuple[str, Callable[[FhirClient], tuple[bool, str]]]] = [
     ("domain_constraint_backstop_survives_missing_patient_id", test_domain_constraint_backstop_survives_missing_patient_id),
     ("cross_patient_tool_call_blocked", test_cross_patient_tool_call_blocked),
     ("shift_summary_reports_nothing_gathered_yet", test_shift_summary_reports_nothing_gathered_yet),
+    ("reference_layer_query_isolation", test_reference_layer_query_isolation),
+    ("reference_layer_dailymed_real_match", test_reference_layer_dailymed_real_match),
+    ("reference_layer_medlineplus_real_match", test_reference_layer_medlineplus_real_match),
+    ("reference_layer_dailymed_honest_no_reference", test_reference_layer_dailymed_honest_no_reference),
+    ("reference_layer_medlineplus_honest_no_reference", test_reference_layer_medlineplus_honest_no_reference),
+    ("reference_layer_mere_mention_does_not_trigger", test_reference_layer_mere_mention_does_not_trigger),
+    ("reference_layer_past_tense_history_does_not_trigger", test_reference_layer_past_tense_history_does_not_trigger),
 ]
 
 

@@ -230,6 +230,31 @@ class CompareSignoutToChartOutput(BaseModel):
     partial_failures: list[str] = Field(default_factory=list)
 
 
+# --- Medical reference layer (app/reference_layer.py) -----------------------
+#
+# NOT a tool the model calls -- a deterministic post-processing step run
+# after verify_response(), reading only the verified final response text
+# (never the model's own context, never a superseded draft). Not a
+# correctness check: it never blocks, flags, or contradicts the response,
+# purely additive informational footnotes, so it adds no coverage to
+# verify_response() itself -- documented explicitly, the same honest
+# distinction already made for summarize_shift_events' SYSTEM_PROMPT rule.
+# A separate structured field (ChatTurnResult.reference_notes), never
+# concatenated into response_text, so it's unambiguously distinguishable
+# from something the model itself asserted -- a data-level guarantee, not
+# a formatting convention.
+
+
+class ReferenceNote(BaseModel):
+    subject_type: Literal["medication", "condition"]
+    subject_name: str
+    source: Literal["DailyMed", "MedlinePlus"]
+    note_text: str | None = Field(
+        None, description="None means no reference note is available for this item -- never fabricated or paraphrased from memory."
+    )
+    source_url: str | None = Field(None, description="Link to the real DailyMed label or MedlinePlus page this note was drawn from.")
+
+
 # --- shared tool-failure envelope (ARCHITECTURE.md Section 2, 4) ------------
 
 
