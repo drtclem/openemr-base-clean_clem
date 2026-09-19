@@ -641,6 +641,16 @@ silently absent:
   planned) that recovers a note for an older-format label, since doing
   so would require the deterministic-extraction constraint to be
   loosened.
+- **NEW, 2026-09-18: dosage thresholds and interaction flags have no eval
+  coverage, because no feature exists yet.** `ARCHITECTURE.md` §3.2
+  records these as explicit future work alongside `check_allergy_conflict`
+  -- no code in `app/` implements a dosage-threshold or interaction-flag
+  check today, so there is nothing for an eval case to exercise. Named
+  here rather than left silently absent, same discipline as the other
+  gaps in this section: when the feature lands, it needs the same
+  treatment `check_allergy_conflict`'s Phase 5 cross-reactivity addition
+  got -- a hard, code-level check with its own regression test, not a
+  prompt instruction.
 
 ## Unit-tier invariant checks (`evals/unit_tests.py`)
 

@@ -86,6 +86,22 @@ loop makes the verification layer (Section 3) straightforward to insert as an ex
 "model drafts a response" and "response reaches the resident." A heavier abstraction layer would
 make it harder to guarantee that insertion point is never skipped.
 
+**Correcting the record, 2026-09-18 (documentation update reflecting an existing decision, not a
+new design choice):** the two reasons above are the entire justification. Single-agent was never
+chosen because multiple patients in context would "confuse" the model — that would be a claim
+about model capability, not a system-design decision, and this project doesn't need to make it.
+The cross-patient guard is direct, code-level evidence to the contrary: `run_turn` in `app/agent.py`
+already tracks per-patient state correctly within a single agent's own turn, filtering
+`turn_records` down to `records_for_active_patient` before grounding runs, and separately rejecting
+any tool call whose target patient doesn't match the declared active one
+(`THREAT_MODEL.md` §4.1/§4.2, `evals/unit_tests.py::test_cross_patient_tool_call_blocked`). A
+single agent already handles a conversation touching multiple patients correctly; if it didn't,
+that mechanism wouldn't be sufficient, and no amount of adding more agents would fix a model
+confusing patients within one of them anyway. The real reasons are enforcement (Section 1.2's
+verification-checkpoint argument) and shape (every USERS.md use case is one resident, one
+conversation, sequential tool calls — nothing here decomposes into distinct specialized roles like
+a retrieval agent and a reasoning agent), not a workaround for a model limitation.
+
 ## 1.3 Data access and authorization
 
 Data is retrieved exclusively through OpenEMR's REST/FHIR API (never the database directly), using
@@ -108,6 +124,17 @@ sensitivity filtering either** -- this was never a UI-only gap that a better gra
 close on its own. Section 3.3's compensating control is not a defensive no-op; it is the only
 thing standing between a restricted visit and the model's context, confirmed necessary rather than
 assumed necessary.
+
+**Privacy and agent count are independent decisions, 2026-09-18 (documentation update, not a new
+design choice):** everything above -- the `user/`-scoped token binding, the sensitivity
+compensating control -- is enforced at the auth/token and data-retrieval layer, and holds
+identically regardless of how many agents this system runs. Access control does not get weaker if
+a future version adds a second agent, and it is not the reason there's only one today. Single-agent
+(Section 1.2) is a verification-integrity and complexity decision -- keeping the checkpoint between
+model draft and resident-facing response un-skippable, and not adding coordination machinery
+nothing here requires. Privacy is a separate concern, already fully addressed by Section 1.3 and
+3.3 on their own terms, and would need to be addressed the same way even if this were a
+multi-agent system.
 
 # 2. Tool design
 
@@ -136,6 +163,36 @@ succeeded with no data. This is a hard rule, not a suggestion, because of Sectio
 # 3. Verification system
 
 Two distinct layers, run after the model drafts a response and before the resident sees it.
+
+**Tool vs. verification step, 2026-09-18 (documentation update clarifying an existing distinction,
+not a new design choice):** these are different categories, not synonyms. `get_patient_snapshot`
+(and every tool in Section 2's table) is a **retrieval tool** -- it fetches data and feeds it into
+the model's context; whether that data gets used correctly is still the model's own reasoning to
+get right or wrong. `check_allergy_conflict` is a **verification step** -- a forced, deterministic
+domain-constraint check (Section 3.2) that runs independent of what the model concluded, not
+something the model can choose to skip. Source attribution (3.1) is neither a tool nor something
+the model invokes; it's a code check that runs automatically against every drafted response's tool
+output, with no model participation in whether it happens.
+
+This is why `check_allergy_conflict` is not redundant with the allergy list already present in
+`get_patient_snapshot`'s output. The snapshot's allergy data is passive: the model might read it
+and reason correctly about a proposed medication, or might not, the same way it might correctly
+read anything else in its context. `check_allergy_conflict` is forced and deterministic regardless
+of the model's own judgment -- it makes an allergy-conflicting response structurally impossible to
+complete, rather than trusting the model to have reasoned well over data it already had. The
+distinction is load-bearing, not academic, evidenced by a real bug earlier in this project (commit
+`822dd92`, 2026-09-16, "trajectory-verified domain-constraint check + gate/attempt-rate reporting"):
+`evals/cases.py`'s own `_check_domain_constraint_hard_block` originally scored
+`domain_constraint_allergy_hard_block` as a pass purely by scanning `result.response_text` for
+conflict-sounding words ("allerg", "conflict", "contraindicat", etc.) -- it never checked whether
+`check_allergy_conflict` had actually run. A response could pass this invariant on wording alone,
+from the model getting lucky off general knowledge, with the hard-coded check never having fired at
+all. The fix added a trajectory check -- confirming `check_allergy_conflict` appears in the turn's
+real tool calls, or that `verify_response()`'s own independent domain-constraint re-check enforced
+it server-side -- before crediting the case as protected. This is the exact failure mode the
+tool-vs-verification-step distinction above exists to prevent: text that merely sounds correct is
+not the same guarantee as a forced, deterministic check having actually run, and this incident is
+concrete proof an eval suite can be fooled by the former while missing the latter.
 
 ## 3.1 Source attribution
 
@@ -233,6 +290,18 @@ before this touches real patients. The tool's output now reports `cross_reactive
 resident-facing response and this system's own logs can distinguish the two rather than presenting
 an inferred class relationship as if it were an exact match on the chart.
 
+**Scope decision: dosage thresholds and interaction flags, 2026-09-18 (documentation update
+recording an existing decision, not a new design choice):** the PRD names these alongside allergy
+conflicts as domain constraints. They are **explicit future work, not in scope for this build** --
+the same treatment already given to the drug-class table above, which is documented as a stand-in
+sized to this project's fixture data rather than a claim of full clinical decision-support
+coverage. No dosage-threshold or interaction-flag check exists anywhere in `app/` today; this is a
+deliberate deferral, not an oversight discovered while writing this note. A production deployment
+implementing these would need the same treatment §3.2's cross-reactivity table already got: a
+licensed, maintained reference (First Databank/Medi-Span/Multum-style) behind a hard, code-level
+check, not model judgment or a curated stand-in table asked to bear more weight than it was sized
+for.
+
 ## 3.3 Sensitivity compensating control
 
 Confirmed necessary, not just deliberately redundant (Section 1.3): a resident's own `user/`-scoped
@@ -283,6 +352,41 @@ the agent's own logs should make the same kind of statement possible about every
 - **The sensitivity compensating control (3.3) is a deliberate duplication of platform logic.**
   If OpenEMR's own filtering is later confirmed to work correctly for user-scoped tokens, this
   control becomes redundant rather than harmful, the safer failure direction.
+- **Measured load-test latency and the configured alert threshold are different numbers doing
+  different jobs, 2026-09-18 (documentation update, not a new measurement):** `PERFORMANCE_BASELINE.md`'s
+  droplet load test measured p95 ≈ 37.0s at 10 concurrent residents (post-resize, all three
+  independent sources agreeing within a few seconds). §7.7's alert threshold is 30,000ms / 30s. These
+  are not interchangeable -- the 37s figure is a real, observed value from a specific concurrent-load
+  test scenario; the 30s figure is a threshold chosen from single-user, uncontended baseline traffic
+  (§7.7's "Where the p95 thresholds came from"), deliberately set to catch a genuine regression
+  without firing on ordinary variance. That the load test's measured figure now exceeds the
+  configured threshold is an honest, expected finding under concurrency, not a contradiction or a
+  sign the threshold was set wrong for its actual purpose.
+
+  The fix for this gap is not one thing. Four scaling levers exist because they solve four
+  different problems, not the same one:
+  - **(a) Separating the Co-Pilot service onto its own infrastructure, away from OpenEMR**
+    (`COST_ANALYSIS.md`'s 1,000-user tier) -- fixes **resource contention**: the audit found the
+    shared droplet already running near capacity with just the base OpenEMR stack, so concurrent
+    agent traffic risks starving OpenEMR itself, independent of the agent's own latency.
+  - **(b) Horizontal scaling behind a load balancer** (`COST_ANALYSIS.md`'s 10,000-user tier) --
+    fixes **concurrency**: multiple service instances handling more simultaneous residents than one
+    process can, independent of how fast any single request completes.
+  - **(c) A managed database for Langfuse**, not a single self-hosted container -- protects
+    **observability accuracy, not clinical-data speed**. This is not a hypothetical: the exact
+    failure mode already happened (`PERFORMANCE_BASELINE.md`'s droplet CPU-contention incident,
+    `ERROR_ANALYSIS.md` Entry 6) -- Langfuse's own span ingestion silently undercounted (5/20 spans)
+    under load, meaning the p95-latency Monitor read `severity: OK` through a real 154-second
+    resident wait. A managed DB is about trusting what the dashboard says, not making the agent
+    faster.
+  - **(d) FHIR caching / bulk-export** -- the actual fix for the measured latency bottleneck itself.
+    `PERFORMANCE_BASELINE.md` Stage 2 confirms directly: OpenEMR's own FHIR backend, not the agent
+    service, is consistently the most CPU-loaded container under load (116%→156%), while the
+    agent's own process footprint stays trivial (peak 9.1% CPU) because it's I/O-bound waiting on
+    FHIR round-trips. Levers (a)-(c) fix contention, concurrency capacity, and observability
+    trustworthiness respectively; only (d) addresses why any individual request is slow. Compressing
+    these into a single "we need a database" statement would misdescribe which problem each lever
+    actually solves.
 
 # 7. Engineering requirements
 
