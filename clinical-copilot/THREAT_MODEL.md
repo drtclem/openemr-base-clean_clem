@@ -402,7 +402,7 @@ than this change, not attempted here.
 live-verified; the curated-vocabulary detection/enforcement blind spots
 (this section's other two sub-findings) remain fully open.
 
-### 4.5 Public, unauthenticated `/chat` and `/ui` — actual severity is PHI exposure, not just cost — **High, Largely mitigated 2026-09-17 (residual gap below)**
+### 4.5 Public, unauthenticated `/chat` and `/ui` — actual severity is PHI exposure, not just cost — **High, code-level fix landed 2026-09-17, actually deployed and verified live 2026-09-18/19 (residual gap below)**
 
 `README.md`'s "Known gaps" already documents that the droplet's port 8420
 is public with zero authentication, framed primarily as an **API-cost**
@@ -419,38 +419,170 @@ prevents any XSS from attacker-influenced chart content reaching the
 browser DOM — that specific sub-risk was already mitigated — but it did
 nothing about the underlying unauthenticated data-access path.
 
-**What changed:** Phase 1 (`CLAUDE_CODE_BUILD_INSTRUCTIONS.md`, present in
-the working tree, not yet fully committed) added the resident-scoped
+**What changed (code, committed 2026-09-17):** Phase 1
+(`CLAUDE_CODE_BUILD_INSTRUCTIONS.md`) added the resident-scoped
 `authorization_code` login this finding's fix implicitly called for.
 `POST /chat` (`app/main.py:424`) now resolves a session from the
 `copilot_session` cookie and returns a plain 401 with no data if one isn't
-present — confirmed live: a bare `curl -X POST /chat` with no cookie gets
-401, not a chart. `GET /ui` shows a "Log in with OpenEMR" gate (calling
-`GET /me`, `app/main.py:412`) instead of the chat form until that login
-completes. The core mechanism this finding described — *zero*
-authentication, service-credential-wide read access to any caller — no
-longer exists.
+present — confirmed live **against the local dev stack** at the time: a
+bare `curl -X POST /chat` with no cookie gets 401, not a chart. `GET /ui`
+shows a "Log in with OpenEMR" gate (calling `GET /me`, `app/main.py:412`)
+instead of the chat form until that login completes. The core mechanism
+this finding described — *zero* authentication, service-credential-wide
+read access to any caller — no longer exists **in the code**. Whether it
+existed on the actual grading deployment is a separate question this
+document did not check at the time — see the 2026-09-18/19 incident below,
+which found the answer was no, for reasons that had nothing to do with
+whether this code was correct.
 
-**Residual gap, not fully closed:** the login is real, but for the current
-grading deployment specifically, the credential behind it (`admin`/`pass`)
-is the same one `README.md` publishes for graders to use, by design. So
-while every `/chat` caller is now a real, authenticated OpenEMR session
-(closing the *unattributed, credential-less* read this finding described),
-anyone who reads the README can still complete that login and reach the
-same data `admin` can reach — which, per §4.3's confirmed cross-provider
-ACL gap, is broader than "their own" patients. This is a materially
-smaller, qualitatively different exposure (a documented, revocable
-credential behind a real OAuth flow, not an anonymous unauthenticated
-port) — but it is not zero, and is worth naming explicitly rather than
-treating "login added" as fully closing this finding.
+**Residual gap, narrowed 2026-09-18, not fully closed:** the login is real,
+and the credential behind it has changed. Previously, the publicly
+documented grading credential was `admin`/`pass` — full ACL-group `admin`,
+OpenEMR's own root-equivalent role (per `audit-notes.md`'s gacl matrix:
+write on every clinical/financial capability, plus ACL Administration,
+Database Reporting, Practice Settings, and Documents Delete). It has been
+rotated to a dedicated, purpose-built account, `grader_1` (ACL group
+`Clinicians`, Provider off — created via the real Add User admin form, the
+same precedent as `copilot_resident_1`/`clin_1`, on both the local dev
+stack and the live grading droplet), documented in both `README.md` (root)
+and `clinical-copilot/README.md` in place of `admin`/`pass`.
 
-**Likelihood: Low-Medium now** (was High) — requires knowing/using the
-documented grading credential, not just reaching an open port. **Impact:
-unchanged if exploited** (still real PHI, still broader than the
-credential-holder's "own" patients per the cross-provider gap). **Status:
-Largely mitigated** — the zero-auth mechanism this finding named is gone;
-the residual risk is now a credential-management question (rotate/scope
-the grading credential post-grading), not an architectural one.
+This narrows one real dimension of exposure and leaves another **fully
+open, confirmed empirically, not assumed**: if this credential leaks and
+someone uses it to log into OpenEMR's own web UI directly (not just
+through this app), `grader_1` cannot touch Billing, Practice Settings, ACL
+Administration, or Documents Delete, and cannot write outside a
+clinician's normal clinical capabilities — a materially smaller blast
+radius than a leaked `admin` login, which is full system compromise.
+**But the PHI-breadth this finding actually cares about — what `/chat`
+itself can read — is unchanged.** Confirmed live: authenticating as
+`grader_1` and calling `get_patient_snapshot` against pid4 (Dan
+Otherprovider, a patient assigned to `admin`, not `grader_1`'s own
+provider) succeeded and returned his real conditions/medications, identical
+in breadth to what the old `admin` credential could reach. This is
+because the cross-provider gap (§4.3) lives in OpenEMR's FHIR API itself,
+which — per Finding 12 (`audit-notes.md`) already showing FHIR bypasses
+UI-layer sensitivity ACL — does not scope patient visibility by the
+authenticated user's ACL group or provider assignment at all. Swapping
+`admin` for a narrower ACL group changes what the credential can do inside
+OpenEMR's own UI; it does nothing to which patients' data `/chat` can read
+through the FHIR path, since that path was never gated by ACL group to
+begin with. Anyone completing this login, `admin` or `grader_1`, can still
+reach any patient's chart via `/chat`, not just "their own."
+
+**Incident, discovered and closed 2026-09-18/19: the live droplet was never
+actually running the Phase 1 login gate at all.** While verifying `grader_1`
+end-to-end against the real grading droplet (157.230.11.142) — not the
+local dev stack, where the same verification already passed cleanly — the
+verification itself failed, and the reason was serious: the droplet's
+`/chat` had **zero authentication of any kind**, live, this entire time.
+Confirmed directly: `curl -X POST http://157.230.11.142:8420/chat` with no
+cookie returned HTTP 200 with Alice Testpatient's real (synthetic-demo)
+conditions, medications, and allergy data. This is not a residual gap in
+*which* credential is documented (the subject of this section up to this
+point) — it is the exact zero-auth mechanism this finding originally
+described, still fully present on the one deployment graders actually
+reach, despite this document already describing it above as "Largely
+mitigated" once Phase 1 landed. The docs were accurate about what the
+*code* did; they were wrong about what was actually *deployed*, and no one
+had checked the two against each other on the live droplet until tonight.
+
+Root cause, traced fully rather than patched blindly, three independent
+problems stacked on top of each other:
+
+1. **The droplet's git checkout was frozen at commit `822dd92` (2026-09-16),
+   two days before Phase 1 (`24448c1`, 2026-09-17) even existed** — and,
+   it turned out, none of the 21 commits since `822dd92`, Phase 1 included,
+   had ever been pushed to either git remote (`origin` or `gitlab`) before
+   tonight. This was not a missed deploy step; the code had never left the
+   development machine. Fixed by pushing `main` to `origin` (which the
+   droplet tracks) and fast-forwarding the droplet's checkout
+   (`822dd92`→`dc75515`) — the droplet had its own pre-existing uncommitted
+   local edits too (partial, older catch-up work, unrelated to Phase 1),
+   preserved via `git stash` rather than discarded.
+2. **`clinical-copilot/.env` on the droplet had never been updated for a
+   non-localhost deployment** — `COPILOT_BASE_URL` was unset (defaulting to
+   `http://localhost:8420`) and `OPENEMR_BASE_URL` was `https://localhost:9300`,
+   both of which this project's own `README.md` setup docs already warned
+   would need updating "if you run this somewhere else, e.g. the droplet" —
+   advice that was apparently never acted on, because the droplet never ran
+   code that needed a real browser-facing redirect until tonight (password
+   grant, the pre-Phase-1 mechanism, is server-to-server only and never hits
+   this). Fixed by setting both to the droplet's public address.
+3. **OpenEMR's own OAuth client on the droplet was registered but never
+   patched for this app's real `redirect_uri`/full scope** (`redirect_uri`
+   was still the placeholder from initial registration; `scope` was missing
+   `user/Encounter.read`/`user/Observation.read`) — the exact retrofit
+   `README.md`'s own setup section already documents as a required step.
+   Fixed via the same `UPDATE oauth_clients` pattern that section describes.
+
+Fixing those three surfaced a **fourth, unrelated, and independently
+serious problem**, not caused by tonight's work: OpenEMR's own PHP
+container (`development-easy-openemr-1`) had been running in a Docker
+`unhealthy` state continuously since it was last started
+(`2026-09-16T23:34:34Z`) — confirmed via `docker compose ps` and container
+logs showing the identical fatal error recurring every single minute for
+the full 2+ days: `vendor/autoload.php` did not exist inside the container
+at all, so *every* request to `oauth2/default/authorize` 500'd, for any
+account, `admin` included. **The Phase 1 login could not have worked on
+this droplet even if it had been deployed on day one.** Fixed with
+`composer install --no-dev --optimize-autoloader` inside the container
+(a targeted dependency install, not a rebuild or restart); confirmed via
+`docker compose ps` reporting `healthy` again and the fatal error no longer
+recurring in subsequent log windows.
+
+A **fifth** problem then surfaced testing the actual browser flow:
+OpenEMR's global setting `site_addr_oath` (`globals` table) was hardcoded
+to `https://localhost:9300` — correct for local dev (browser and server are
+the same machine) but wrong for the droplet, where it silently redirected
+an external grader's browser to their own unreachable localhost mid-flow,
+after the sign-in form but before a session cookie was ever set. Fixed with
+one `UPDATE globals` statement; re-verified.
+
+**Final verification, real browser automation, not curl:** `grader_1`
+completed the full round trip against the live droplet — real OpenEMR
+sign-in form, real consent screen with default scopes, redirect through
+`/callback`, `copilot_session` cookie set, landing on `/ui` as `Logged in
+as a2c79ed6-496d-4f59-98e3-ebcc1619c3de`. A real chat message returned a
+real, grounded, verified response (Alice Testpatient's actual conditions,
+medications, allergy, and the pid6 duplicate-record warning,
+`verification_passed: true`). The zero-auth check was re-run after the fix:
+`curl -X POST /chat` with no cookie now returns 401, not data.
+
+**Exposure window and what's known about it:** the droplet has had zero
+`/chat` authentication continuously since it was first stood up (long
+before Phase 1 code existed, and the whole time since, since Phase 1 was
+never actually deployed there) through the fix tonight. The retained
+process logs (`request_timing.log`, `uvicorn*.log`) show every historical
+`POST /chat` request came from `127.0.0.1` (this project's own eval-suite/
+load-test runs on the droplet itself) or from this workstation's own
+address (this project's own prior manual/Bruno-equivalent testing,
+documented in `clinical-copilot/README.md`'s Bruno section) — no evidence
+of third-party access in what was retained, though log completeness
+before tonight was not independently audited beyond what these files
+contain. The data exposed was synthetic demo-patient data throughout
+(`audit-notes.md`: fabricated patients, 900-range SSNs never issued), not
+real PHI — the finding's significance is the mechanism, assessed as if it
+scaled to a real deployment, which is exactly this threat model's purpose.
+
+**Likelihood: Low-Medium, unchanged** — still requires knowing/using the
+documented grading credential, not just reaching an open port; rotating
+*which* account is documented doesn't change how easy the credential is to
+obtain (it's still published in a committed README either way). **Impact:
+split, not uniformly reduced.** Impact via `/chat`'s own read surface is
+**unchanged** (still real PHI, still practice-wide per the still-open
+cross-provider gap — confirmed live against pid4 above, not assumed).
+Impact if the credential is instead used to log into OpenEMR's own UI
+directly is **substantially reduced** (a clinician-shaped account, not a
+full system compromise). **Status: Largely mitigated, credential narrowed,
+and — as of tonight — actually deployed and live**, not just committed to
+git. The zero-auth mechanism this finding named is gone from the real,
+reachable droplet, confirmed by re-running the exact same live check that
+found it broken; the grading credential's non-`/chat` blast radius is now
+bounded to a real clinical role instead of root; the `/chat`-path
+PHI-breadth exposure this finding is actually about remains open, and can
+only close alongside §4.3's
+cross-provider gap, not by rotating which account is published.
 
 ### 4.6 PHI in logs and self-hosted telemetry — **Medium, Partially mitigated**
 
@@ -650,7 +782,7 @@ the local-dev-only `false` override clearly scoped and documented in
 | 4.3 | Resident-scoped auth (landed, uncommitted) | — | — | **Present, partially reviewed** — cross-provider role-scope gap confirmed real/unfixed; session/conversation binding still open |
 | 4.4 | Indirect prompt injection via uncoded/free-text chart fields | Medium | Medium-High | **Partially mitigated** -- structural prevention layer closed 2026-09-18; curated-vocabulary detection/enforcement blind spots still open |
 | 4.4a | Domain-constraint hard-block only covers ~27 hardcoded drug names | Medium | High | **Partially mitigated / Open** |
-| 4.5 | Public unauthenticated `/chat` + `/ui` — real risk is PHI exposure, not just cost | Low-Medium (was High) | High if exploited | **Largely mitigated** — real login now required; residual risk is the documented grading credential, not zero-auth |
+| 4.5 | Public unauthenticated `/chat` + `/ui` — real risk is PHI exposure, not just cost | Low-Medium (was High) | High via `/chat` (unchanged, confirmed live -- cross-provider gap unaffected by credential); Low via direct OpenEMR UI misuse (was High -- credential rotated `admin`→`grader_1`, a clinician-shaped account) | **Largely mitigated, actually deployed 2026-09-18/19** — the live grading droplet was found running zero-auth code well after this was documented as fixed (deployment drift + a broken OpenEMR container + a hardcoded localhost setting, all traced and closed same night, see incident writeup above); real login now genuinely required there, re-verified end-to-end; grading credential rotated to a narrower account; residual `/chat`-path PHI-breadth risk is §4.3's cross-provider gap, not credential choice |
 | 4.6 | PHI in logs / self-hosted Langfuse, no retention/redaction policy | — | Medium | **Partially mitigated** |
 | 4.7 | No `conversation_id` ↔ identity binding | Low-Medium | Medium | **Open** |
 | 4.7a | Unbounded in-memory conversation store (availability) | Medium | Medium | **Open** |

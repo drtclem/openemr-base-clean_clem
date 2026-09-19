@@ -122,8 +122,11 @@ uvicorn app.main:app --reload --port 8420
 
 `/chat` requires a real OpenEMR login (Phase 1, `CLAUDE_CODE_BUILD_INSTRUCTIONS.md`) -- there is no
 more anonymous/shared-credential access. Open http://localhost:8420/ui in a browser, click **Log in
-with OpenEMR** (`admin`/`pass`, or any real account), and use the chat form; the page handles the
-session cookie for you and keeps `conversation_id` across turns automatically.
+with OpenEMR** (`grader_1` / `6-_0fQkp3-@j0KtW7IFrh4I0YGna` -- a dedicated, narrow-scope grading
+account, ACL group `Clinicians`, Provider off, created the same way as `copilot_resident_1` below;
+see `THREAT_MODEL.md` 4.5 for why this replaced the previously-documented `admin`/`pass` -- or use
+any real account), and use the chat form; the page handles the session cookie for you and keeps
+`conversation_id` across turns automatically.
 
 A bare `curl -X POST /chat` with no session cookie now gets a clean 401 by design:
 

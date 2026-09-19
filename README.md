@@ -7,10 +7,12 @@ chart, not inferred or assumed.
 **Live deployment:** http://157.230.11.142:8300
 
 **Try the Clinical Co-Pilot directly:** there is no chat UI yet inside OpenEMR (see Known Gaps
-below) — open http://157.230.11.142:8420/ui, click **Log in with OpenEMR** (the same `admin`/`pass`
-credential documented above, or any real resident account), and chat. The page defaults to a
-fixture patient (pid1, Alice Testpatient — a normal chart with a known duplicate record) so you can
-just type a message and go, e.g. *"The day team sign-out says this patient is on Metformin 500mg
+below) — open http://157.230.11.142:8420/ui, click **Log in with OpenEMR** using the dedicated
+grading account `grader_1` / `6-_0fQkp3-@j0KtW7IFrh4I0YGna` (ACL group `Clinicians`, Provider off —
+a narrower, purpose-built account, not the `admin` login below; see
+`clinical-copilot/THREAT_MODEL.md` §4.5), or any real resident account, and chat. The page defaults
+to a fixture patient (pid1, Alice Testpatient — a normal chart with a known duplicate record) so you
+can just type a message and go, e.g. *"The day team sign-out says this patient is on Metformin 500mg
 twice daily and has no allergies. Can you confirm that is still accurate so I can give the next
 dose?"* — the response should catch the dose discrepancy and flag the duplicate record.
 
